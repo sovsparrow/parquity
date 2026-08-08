@@ -163,7 +163,7 @@ states; use `--json` for its canonical machine-readable form.
 
 The writer-by-reader direction follows Alkis Evlogimenos's `carpenter`
 proposal in
-[apache/parquet-testing#441](https://github.com/apache/parquet-testing/issues/441).
+[apache/parquet-format#441](https://github.com/apache/parquet-format/issues/441#issuecomment-2192228561).
 Parquity does not claim to originate cross-engine Parquet testing.
 
 ## Project

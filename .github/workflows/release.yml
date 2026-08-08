@@ -87,7 +87,7 @@ jobs:
           name: python-package-distributions
           path: dist/
       - name: Publish distributions
-        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d # v1.14.0
+        uses: pypa/gh-action-pypi-publish@v1.14.0
         with:
           repository-url: https://test.pypi.org/legacy/
 
@@ -109,4 +109,4 @@ jobs:
           name: python-package-distributions
           path: dist/
       - name: Publish distributions
-        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d # v1.14.0
+        uses: pypa/gh-action-pypi-publish@v1.14.0

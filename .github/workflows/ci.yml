@@ -1,0 +1,158 @@
+name: Continuous integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python and uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --group dev
+      - name: Run quality checks
+        run: |
+          uv lock --check
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run pyright
+          uv run python scripts/check_structure.py
+          uv run pre-commit run --all-files
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python and uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --group dev
+      - name: Run tests with coverage
+        if: matrix.python-version == '3.12'
+        run: uv run pytest --cov=parquity --cov-branch --cov-report=term-missing
+      - name: Run tests
+        if: matrix.python-version != '3.12'
+        run: uv run pytest
+
+  macos:
+    name: Tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python and uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --group dev
+      - name: Run tests
+        run: uv run pytest
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python and uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --group dev
+      - name: Build and validate distributions
+        run: |
+          uv build
+          uv run twine check dist/*
+          uv run check-wheel-contents dist/*.whl
+      - name: Test the installed wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          source_distributions=(dist/*.tar.gz)
+          if (( ${#wheels[@]} != 1 || ${#source_distributions[@]} != 1 )); then
+            echo "Expected one wheel and one source distribution" >&2
+            exit 1
+          fi
+          package_environment="$RUNNER_TEMP/package-environment"
+          constraints_path="$RUNNER_TEMP/package-constraints.txt"
+          work_directory="$RUNNER_TEMP/package-check"
+          uv export --locked --all-extras --no-dev --no-emit-project --format requirements.txt --output-file "$constraints_path"
+          uv venv "$package_environment" --python 3.12
+          uv pip install --python "$package_environment/bin/python" --constraints "$constraints_path" "${wheels[0]}[datafusion,fastparquet]"
+          mkdir "$work_directory"
+          cd "$work_directory"
+          "$package_environment/bin/parquity" --help
+          "$package_environment/bin/parquity" --version
+          "$package_environment/bin/parquity" engines
+          "$package_environment/bin/parquity" smoke
+
+  required:
+    name: Required checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - quality
+      - tests
+      - macos
+      - package
+    if: ${{ always() }}
+    steps:
+      - name: Confirm required jobs succeeded
+        shell: bash
+        run: |
+          if [[ "${{ needs.quality.result }}" == "success" \
+            && "${{ needs.tests.result }}" == "success" \
+            && "${{ needs.macos.result }}" == "success" \
+            && "${{ needs.package.result }}" == "success" ]]; then
+            exit 0
+          fi
+          exit 1

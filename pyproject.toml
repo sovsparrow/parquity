@@ -1,0 +1,132 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "parquity"
+version = "0.1.0"
+description = "Find and reproduce semantic disagreements between Parquet engines."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Batuhan Turgay" }]
+keywords = ["parquet", "interoperability", "testing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Testing",
+  "Typing :: Typed",
+]
+dependencies = [
+  "duckdb>=1.5.5",
+  "hypothesis>=6.165.1",
+  "polars>=1.43.2",
+  "pyarrow>=25.0.0",
+]
+
+[project.optional-dependencies]
+datafusion = ["datafusion>=54.0.0"]
+fastparquet = ["fastparquet>=2026.5.0"]
+
+[project.scripts]
+parquity = "parquity.cli:main"
+
+[dependency-groups]
+dev = [
+  "check-wheel-contents==0.6.3",
+  "pip-audit==2.10.1",
+  "pre-commit==4.6.1",
+  "pyarrow-stubs==20.0.0.20260625",
+  "pyright[nodejs]==1.1.411",
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "ruff==0.16.1",
+  "twine==7.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/parquity"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/.pre-commit-config.yaml",
+  "/.python-version",
+  "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
+  "/docs",
+  "/LICENSE",
+  "/README.md",
+  "/SECURITY.md",
+  "/VERSIONING.md",
+  "/pyproject.toml",
+  "/scripts",
+  "/src",
+  "/tests",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+preview = false
+
+[tool.ruff.lint]
+select = [
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "W",
+  "I",
+  "UP",
+  "B",
+  "BLE",
+  "A",
+  "C4",
+  "C90",
+  "SIM",
+  "RET",
+  "PIE",
+  "PERF",
+  "LOG",
+  "G",
+  "S",
+  "DTZ",
+  "PLC",
+  "PLE",
+  "PLW",
+  "RUF",
+]
+explicit-preview-rules = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+# Command-scoped imports preserve the dependency-light CLI startup boundary.
+"src/parquity/cli/main.py" = ["PLC0415"]
+"tests/**/*.py" = ["S101"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+include = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+source = ["parquity"]
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+skip_covered = false

@@ -1,0 +1,318 @@
+name: Product acceptance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: Product acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ACCEPTANCE_DIR: ${{ runner.temp }}/product-acceptance
+      PACKAGE_ENV: ${{ runner.temp }}/package-environment
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python and uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --group dev
+      - name: Prepare evidence directory
+        run: mkdir -p "$ACCEPTANCE_DIR"
+      - name: Audit dependencies
+        run: uv run pip-audit --local
+      - name: Build and validate distributions
+        run: |
+          uv build
+          uv run twine check dist/*
+          uv run check-wheel-contents dist/*.whl
+      - name: Install the wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          source_distributions=(dist/*.tar.gz)
+          if (( ${#wheels[@]} != 1 || ${#source_distributions[@]} != 1 )); then
+            echo "Expected one wheel and one source distribution" >&2
+            exit 1
+          fi
+          constraints_path="$RUNNER_TEMP/package-constraints.txt"
+          uv export --locked --all-extras --no-dev --no-emit-project --format requirements.txt --output-file "$constraints_path"
+          uv venv "$PACKAGE_ENV" --python 3.12
+          uv pip install --python "$PACKAGE_ENV/bin/python" --constraints "$constraints_path" "${wheels[0]}[datafusion,fastparquet]"
+          mkdir -p "$ACCEPTANCE_DIR/work"
+      - name: Inspect installed providers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ACCEPTANCE_DIR/work"
+          "$PACKAGE_ENV/bin/parquity" engines > "$ACCEPTANCE_DIR/engines.json"
+          "$PACKAGE_ENV/bin/python" - "$ACCEPTANCE_DIR/engines.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          raw = path.read_bytes()
+          payload = json.loads(raw)
+          canonical = json.dumps(
+              payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+          ).encode("utf-8") + b"\n"
+          if raw != canonical:
+              raise SystemExit("Engine output is not canonical JSON")
+          expected = [
+              ("pyarrow", True, True),
+              ("duckdb", True, True),
+              ("polars", True, True),
+              ("datafusion", True, False),
+              ("fastparquet", True, True),
+          ]
+          engines = payload.get("engines")
+          actual = [
+              (item.get("name"), item.get("reader"), item.get("writer"))
+              for item in engines
+          ] if isinstance(engines, list) else []
+          if payload.get("format") != "parquity.cli.v1":
+              raise SystemExit("Unexpected engine output format")
+          if payload.get("command") != "engines" or payload.get("status") != "OK":
+              raise SystemExit("Engine inspection did not succeed")
+          if actual != expected or not all(item.get("available") is True for item in engines):
+              raise SystemExit("Installed provider availability or directions are incomplete")
+          PY
+      - name: Run installed smoke check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ACCEPTANCE_DIR/work"
+          "$PACKAGE_ENV/bin/parquity" smoke > "$ACCEPTANCE_DIR/smoke.json"
+          "$PACKAGE_ENV/bin/python" - "$ACCEPTANCE_DIR/smoke.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          raw = path.read_bytes()
+          payload = json.loads(raw)
+          canonical = json.dumps(
+              payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+          ).encode("utf-8") + b"\n"
+          if raw != canonical:
+              raise SystemExit("Smoke output is not canonical JSON")
+          if payload.get("format") != "parquity.cli.v1":
+              raise SystemExit("Unexpected smoke output format")
+          if payload.get("command") != "smoke" or payload.get("status") != "PASS":
+              raise SystemExit("Installed smoke check did not pass")
+          PY
+      - name: Create synthetic inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ACCEPTANCE_DIR/work"
+          "$PACKAGE_ENV/bin/python" - "$ACCEPTANCE_DIR/input.parquet" <<'PY'
+          import sys
+
+          import pyarrow as pa
+          import pyarrow.parquet as pq
+
+          table = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+          pq.write_table(
+              table,
+              sys.argv[1],
+              compression="NONE",
+              use_dictionary=False,
+              write_statistics=False,
+          )
+          PY
+          cat > "$ACCEPTANCE_DIR/schema.json" <<'JSON'
+          {
+            "format": "parquity.case.v1",
+            "schema": [
+              {
+                "name": "account_id",
+                "nullable": false,
+                "type": {"kind": "int64"}
+              },
+              {
+                "name": "labels",
+                "nullable": true,
+                "type": {
+                  "kind": "list",
+                  "item": {"kind": "string"},
+                  "item_nullable": false
+                }
+              }
+            ],
+            "rows": []
+          }
+          JSON
+      - name: Run bounded fuzz checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ACCEPTANCE_DIR/work"
+          set +e
+          "$PACKAGE_ENV/bin/parquity" fuzz --examples 500 --seed 0 --max-findings 8 --out "$ACCEPTANCE_DIR/generic-run" > "$ACCEPTANCE_DIR/generic-fuzz.json" 2> "$ACCEPTANCE_DIR/generic-fuzz.stderr"
+          generic_code=$?
+          set -e
+          printf '%s\n' "$generic_code" > "$ACCEPTANCE_DIR/generic-fuzz.exit"
+          if [[ "$generic_code" -ne 1 || ! -d "$ACCEPTANCE_DIR/generic-run" ]]; then
+            echo "Generic fuzz did not publish the expected run" >&2
+            exit 1
+          fi
+
+          set +e
+          "$PACKAGE_ENV/bin/parquity" fuzz --schema "$ACCEPTANCE_DIR/schema.json" --examples 100 --seed 42 --max-findings 8 --out "$ACCEPTANCE_DIR/schema-run" > "$ACCEPTANCE_DIR/schema-fuzz.json" 2> "$ACCEPTANCE_DIR/schema-fuzz.stderr"
+          schema_code=$?
+          set -e
+          printf '%s\n' "$schema_code" > "$ACCEPTANCE_DIR/schema-fuzz.exit"
+          if [[ "$schema_code" -eq 0 ]]; then
+            if [[ -e "$ACCEPTANCE_DIR/schema-run" ]]; then
+              echo "Schema fuzz published output without a finding" >&2
+              exit 1
+            fi
+          elif [[ "$schema_code" -eq 1 ]]; then
+            if [[ ! -d "$ACCEPTANCE_DIR/schema-run" ]]; then
+              echo "Schema fuzz did not publish its finding run" >&2
+              exit 1
+            fi
+          else
+            echo "Schema fuzz returned an invalid exit code" >&2
+            exit 1
+          fi
+
+          "$PACKAGE_ENV/bin/python" - "$ACCEPTANCE_DIR/generic-fuzz.json" "$ACCEPTANCE_DIR/schema-fuzz.json" "$schema_code" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          generic_path, schema_path = map(Path, sys.argv[1:3])
+          schema_code = int(sys.argv[3])
+          for path, expected_status in (
+              (generic_path, "RUN_PUBLISHED"),
+              (schema_path, "NO_FINDING" if schema_code == 0 else "RUN_PUBLISHED"),
+          ):
+              raw = path.read_bytes()
+              payload = json.loads(raw)
+              canonical = json.dumps(
+                  payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+              ).encode("utf-8") + b"\n"
+              if raw != canonical:
+                  raise SystemExit(f"{path.name} is not canonical JSON")
+              if payload.get("format") != "parquity.cli.v1":
+                  raise SystemExit(f"{path.name} has an unexpected format")
+              if payload.get("command") != "fuzz" or payload.get("status") != expected_status:
+                  raise SystemExit(f"{path.name} has an unexpected result")
+          PY
+      - name: Scan the synthetic Parquet file
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ACCEPTANCE_DIR/work"
+          set +e
+          "$PACKAGE_ENV/bin/parquity" scan "$ACCEPTANCE_DIR/input.parquet" --out "$ACCEPTANCE_DIR/scan-run" --engines pyarrow,duckdb,polars,datafusion,fastparquet --timeout 30 --max-findings 8 > "$ACCEPTANCE_DIR/scan.json" 2> "$ACCEPTANCE_DIR/scan.stderr"
+          scan_code=$?
+          set -e
+          printf '%s\n' "$scan_code" > "$ACCEPTANCE_DIR/scan.exit"
+          if [[ "$scan_code" -ne 0 || -e "$ACCEPTANCE_DIR/scan-run" ]]; then
+            echo "Synthetic scan did not complete in agreement" >&2
+            exit 1
+          fi
+          "$PACKAGE_ENV/bin/python" - "$ACCEPTANCE_DIR/scan.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          raw = path.read_bytes()
+          payload = json.loads(raw)
+          canonical = json.dumps(
+              payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+          ).encode("utf-8") + b"\n"
+          if raw != canonical:
+              raise SystemExit("Scan output is not canonical JSON")
+          expected = ["pyarrow", "duckdb", "polars", "datafusion", "fastparquet"]
+          if payload.get("format") != "parquity.cli.v1":
+              raise SystemExit("Unexpected scan output format")
+          if payload.get("command") != "scan" or payload.get("status") != "AGREEMENT":
+              raise SystemExit("Synthetic scan did not report agreement")
+          if payload.get("readers") != expected or "output" in payload:
+              raise SystemExit("Synthetic scan did not exercise the complete reader set")
+          PY
+      - name: Replay and triage published runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ACCEPTANCE_DIR/work"
+          runs=("$ACCEPTANCE_DIR/generic-run")
+          if [[ -d "$ACCEPTANCE_DIR/schema-run" ]]; then
+            runs+=("$ACCEPTANCE_DIR/schema-run")
+          fi
+          for run in "${runs[@]}"; do
+            run_name=$(basename "$run")
+            replay_path="$ACCEPTANCE_DIR/$run_name-replay.json"
+            triage_path="$ACCEPTANCE_DIR/$run_name-triage.json"
+            set +e
+            "$PACKAGE_ENV/bin/parquity" replay "$run" > "$replay_path" 2> "$ACCEPTANCE_DIR/$run_name-replay.stderr"
+            replay_code=$?
+            set -e
+            printf '%s\n' "$replay_code" > "$ACCEPTANCE_DIR/$run_name-replay.exit"
+            if [[ "$replay_code" -ne 1 ]]; then
+              echo "Replay did not reproduce $run_name" >&2
+              exit 1
+            fi
+            set +e
+            "$PACKAGE_ENV/bin/parquity" triage "$run" --replay-evidence "$replay_path" > "$triage_path" 2> "$ACCEPTANCE_DIR/$run_name-triage.stderr"
+            triage_code=$?
+            set -e
+            printf '%s\n' "$triage_code" > "$ACCEPTANCE_DIR/$run_name-triage.exit"
+            if [[ "$triage_code" -ne 0 ]]; then
+              echo "Triage did not complete for $run_name" >&2
+              exit 1
+            fi
+            "$PACKAGE_ENV/bin/python" - "$replay_path" "$triage_path" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          for path, command, status in (
+              (Path(sys.argv[1]), "replay", "REPRODUCED"),
+              (Path(sys.argv[2]), "triage", "TRIAGED"),
+          ):
+              raw = path.read_bytes()
+              payload = json.loads(raw)
+              canonical = json.dumps(
+                  payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+              ).encode("utf-8") + b"\n"
+              if raw != canonical:
+                  raise SystemExit(f"{path.name} is not canonical JSON")
+              if payload.get("format") != "parquity.cli.v1":
+                  raise SystemExit(f"{path.name} has an unexpected format")
+              if payload.get("command") != command or payload.get("status") != status:
+                  raise SystemExit(f"{path.name} has an unexpected result")
+          PY
+          done
+      - name: Upload product evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: product-acceptance-evidence
+          path: ${{ runner.temp }}/product-acceptance
+          if-no-files-found: error
+          retention-days: 7

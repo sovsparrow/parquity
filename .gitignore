@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.coverage.*
+.hypothesis/
+.pytest_cache/
+.pyright/
+.ruff_cache/
+.venv/
+build/
+dist/
+htmlcov/
+
+# internal
+home/

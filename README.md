@@ -62,6 +62,9 @@ existing `.parquet` file, without choosing a reference reader.
 ## Install
 
 Parquity requires Python 3.11 or newer.
+Parquity 0.1.0 supports Linux and macOS. Windows is not supported in this
+release; `scan` and replay of scan evidence require POSIX process-group
+supervision.
 
 ```console
 python -m pip install parquity

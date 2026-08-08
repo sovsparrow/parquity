@@ -34,6 +34,15 @@ defaults, and exit behavior. Interactive terminals receive a human-readable
 summary. Redirected or piped stdout receives compact `parquity.cli.v1` JSON.
 Pass `--json` to force that canonical machine output on a terminal.
 
+## Platform support
+
+Parquity 0.1.0 supports Linux and macOS. Windows is not supported in this
+release.
+
+`scan` and replay of scan evidence require POSIX process-group supervision for
+timeouts and descendant cleanup. The pure-Python wheel may install on another
+platform; installation alone does not establish support for its commands.
+
 ## Execution model
 
 `check`, `fuzz`, `smoke`, and replay of generated findings load providers in
@@ -159,11 +168,9 @@ provider.
 The child-process boundary records ordinary provider exceptions, hangs, and
 crashes; it is not a sandbox. It does not restrict filesystem, network,
 credentials, environment variables, OS identity or privileges, memory, CPU,
-disk, or decompression work. On POSIX systems, Parquity supervises the child
-process group. The package's pure-Python wheel tag does not establish
-equivalent containment on an otherwise unverified platform. Run files of
-uncertain provenance in an operating-system or container boundary with least
-privilege and appropriate resource limits.
+disk, or decompression work. Run files of uncertain provenance in an
+operating-system or container boundary with least privilege and appropriate
+resource limits.
 
 ## Replay recorded evidence
 

@@ -38,6 +38,13 @@ fastparquet = ["fastparquet>=2026.5.0"]
 [project.scripts]
 parquity = "parquity.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/sovsparrow/parquity"
+Documentation = "https://github.com/sovsparrow/parquity/tree/v0.1.0/docs"
+Source = "https://github.com/sovsparrow/parquity"
+Issues = "https://github.com/sovsparrow/parquity/issues"
+Changelog = "https://github.com/sovsparrow/parquity/blob/v0.1.0/CHANGELOG.md"
+
 [dependency-groups]
 dev = [
   "check-wheel-contents==0.6.3",

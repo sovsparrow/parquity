@@ -7,6 +7,8 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-09
+
 ### Added
 
 - Compare Parquet output across PyArrow, DuckDB, and Polars, with optional
@@ -27,3 +29,6 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Exercise gzip, Brotli, row-group, and statistics writer options where the
   selected writer supports them.
 - Support Python 3.11 through 3.14 and ship typed package metadata.
+
+[Unreleased]: https://github.com/sovsparrow/parquity/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sovsparrow/parquity/releases/tag/v0.1.0

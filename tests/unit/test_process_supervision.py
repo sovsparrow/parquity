@@ -77,13 +77,25 @@ def test_timeout_kills_a_child_that_does_not_exit_during_grace(tmp_path: Path) -
 
 
 def test_timeout_kills_a_resistant_descendant_and_reaps_the_direct_child(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    original_killpg = process_module.os.killpg
+    probes: list[int] = []
+
+    def permission_lost_after_kill(group: int, requested: int) -> None:
+        probes.append(requested)
+        if requested == 0 and process_module.signal.SIGKILL in probes:
+            raise PermissionError
+        original_killpg(group, requested)
+
+    monkeypatch.setattr(process_module.os, "killpg", permission_lost_after_kill)
     ready = tmp_path / "ready"
     outcome = _run("descendant", tmp_path, ready)
     direct, descendant = (int(value) for value in ready.read_text(encoding="utf-8").split())
     assert outcome.kind == "TIMEOUT"
     assert outcome.terminated and outcome.killed
+    assert probes[-2:] == [process_module.signal.SIGKILL, 0]
     _require_process_absent(direct)
     _require_process_absent(descendant)
     assert not (tmp_path / "worker").exists()
@@ -304,21 +316,9 @@ def _call_worker(
     capsys: pytest.CaptureFixture[str],
 ) -> dict[str, object]:
     directory.mkdir()
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "parquity.worker",
-            "--engine",
-            "pyarrow",
-            "--version",
-            version,
-            "--input",
-            str(source),
-            "--out",
-            str(directory),
-        ],
-    )
+    arguments = ["parquity.worker", "--engine", "pyarrow", "--version", version]
+    arguments += ["--input", str(source), "--out", str(directory)]
+    monkeypatch.setattr(sys, "argv", arguments)
     assert worker_module.main() == 0
     streams = capsys.readouterr()
     assert streams.err == ""

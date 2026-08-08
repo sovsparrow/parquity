@@ -297,7 +297,7 @@ def _wait_group_absent(group: int, deadline: float) -> bool:
     while True:
         try:
             os.killpg(group, 0)
-        except ProcessLookupError:
+        except (PermissionError, ProcessLookupError):  # Owned PGID is no longer signalable.
             return True
         if (remaining := deadline - time.monotonic()) <= 0:
             return False

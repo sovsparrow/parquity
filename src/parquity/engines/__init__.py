@@ -5,8 +5,27 @@ from dataclasses import dataclass
 from importlib import import_module, metadata
 from typing import Literal, NamedTuple, Protocol, cast
 
-from ..verdicts import EngineAvailability
 from .base import EngineDescriptor, EngineIdentity, EngineReader, EngineWriter
+
+
+@dataclass(frozen=True, slots=True)
+class EngineAvailability:
+    name: str
+    distribution: str
+    tier: str
+    reader: bool
+    writer: bool
+    available: bool
+    version: str | None
+    installation_hint: str | None
+    detail: str
+
+    def __post_init__(self) -> None:
+        if self.available and self.version is None:
+            raise ValueError("an available engine requires a version")
+        if not self.available and not self.installation_hint:
+            raise ValueError("an unavailable engine requires an installation hint")
+
 
 CORE_ENGINE_DESCRIPTORS = (
     EngineDescriptor(
@@ -106,9 +125,6 @@ class EngineSelection:
     @property
     def reader_versions(self) -> tuple[tuple[str, str], ...]:
         return tuple((engine.identity.name, engine.identity.version) for engine in self.readers)
-
-    def to_data(self) -> dict[str, object]:
-        return {"writers": list(self.writer_names), "readers": list(self.reader_names)}
 
 
 class ReaderSelection(NamedTuple):
@@ -224,6 +240,17 @@ def resolve_reader_selection(
     return ReaderSelection(names, tuple(readers))
 
 
+def default_engine_names(
+    direction: Literal["reader", "writer"],
+    descriptors: Sequence[EngineDescriptor] = ENGINE_DESCRIPTORS,
+) -> tuple[str, ...]:
+    return tuple(
+        descriptor.name
+        for descriptor in descriptors
+        if descriptor.tier == "core" and getattr(descriptor, direction)
+    )
+
+
 def _require_available(resolutions: tuple[EngineResolution, ...]) -> None:
     unavailable = tuple(
         item.availability for item in resolutions if not item.availability.available
@@ -241,11 +268,7 @@ def _canonical_names(
     descriptors: Sequence[EngineDescriptor],
 ) -> tuple[str, ...]:
     if requested is None:
-        names = [
-            descriptor.name
-            for descriptor in descriptors
-            if descriptor.tier == "core" and getattr(descriptor, direction)
-        ]
+        names = list(default_engine_names(direction, descriptors))
     elif isinstance(requested, str):
         names = [name.strip() for name in requested.split(",")]
     else:

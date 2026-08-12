@@ -13,8 +13,8 @@ import pyarrow as pa
 import pytest
 
 import parquity.cli as cli
-from parquity.arrow_bridge import case_to_arrow
-from parquity.compare import compare_case
+from parquity.case.arrow import case_to_arrow
+from parquity.comparison.table import compare_case
 from parquity.engines import CORE_ENGINE_DESCRIPTORS, resolve_engine, resolve_engines
 from parquity.engines.base import (
     EngineReader,
@@ -22,7 +22,7 @@ from parquity.engines.base import (
     ProfiledEngineWriter,
     ProviderOperationError,
 )
-from parquity.engines.fastparquet_pandas import table_to_pandas
+from parquity.engines.fastparquet import table_to_pandas
 from parquity.findings.upstream_script import render_upstream_repro
 from parquity.matrix import run_matrix
 from parquity.model import Case, Field, Kind, TypeSpec
@@ -210,19 +210,6 @@ def test_fastparquet_writer_preserves_nullable_scalars_for_all_core_and_self_rea
         "fastparquet",
     ]
     assert all(result.verdict is Verdict.PASS for result in run.results)
-
-
-def test_fastparquet_writer_preserves_nullable_int32(tmp_path: Path) -> None:
-    case = _nullable_int32_case()
-    fastparquet = resolve_engine("fastparquet")
-    pyarrow = resolve_engine("pyarrow")
-    assert fastparquet.writer is not None
-    assert pyarrow.reader is not None
-    path = tmp_path / "input.parquet"
-    fastparquet.writer.write(case_to_arrow(case), path)
-    actual = pyarrow.reader.read(path)
-    assert actual.to_pylist() == [{"value": 1}, {"value": None}]
-    assert actual.schema.remove_metadata() == pa.schema([pa.field("value", pa.int32())])
 
 
 @pytest.mark.parametrize(("case", "pandas_dtypes"), _fastparquet_cases())

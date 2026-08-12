@@ -7,7 +7,7 @@ from typing import Literal, cast
 import duckdb
 import pyarrow as pa
 
-from ..writer_profiles import WriterProfileIdentity
+from ..profiles import WriterProfileIdentity
 from .base import EngineIdentity, EngineReaderWriter, ProviderOperationError
 
 

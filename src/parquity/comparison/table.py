@@ -2,17 +2,30 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Protocol, cast
 
 import pyarrow as pa
 
-from .arrow_bridge import arrow_to_rows
-from .comparison_values import value_mismatch
-from .model import Case, Field, Kind, TypeSpec
-from .result_evidence import DifferenceEvidence
-from .verdicts import ComparisonResult, Verdict
+from ..case.arrow import arrow_to_rows, type_to_arrow
+from ..evidence import DifferenceEvidence
+from ..model import Case, Field, Kind, TypeSpec
+from ..verdicts import Verdict
+from .values import value_mismatch
 
 SchemaMismatch = tuple[str, str, DifferenceEvidence]
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonResult:
+    verdict: Verdict
+    path: str
+    detail: str
+    difference: DifferenceEvidence | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.verdict is Verdict.PASS
 
 
 class _SchemaFields(Protocol):
@@ -49,13 +62,6 @@ class _ArrowTypes(Protocol):
 
 
 _ARROW_TYPES = cast(_ArrowTypes, cast(object, pa.types))
-
-
-class _TimestampFactory(Protocol):
-    def __call__(self, unit: str, tz: str | None = None) -> pa.DataType: ...
-
-
-_TIMESTAMP = cast(_TimestampFactory, cast(object, pa.timestamp))
 
 
 def compare_case(case: Case, actual: pa.Table) -> ComparisonResult:
@@ -119,7 +125,7 @@ def _type_mismatch(expected: TypeSpec, actual: pa.DataType, path: str) -> Schema
             return None
         return _type_result(path, expected.kind.value, actual)
     if expected.kind in (Kind.TIMESTAMP, Kind.DECIMAL128):
-        target = _parameterized_arrow_type(expected)
+        target = type_to_arrow(expected)
         return None if actual == target else _type_result(path, str(target), actual)
     return _container_type_mismatch(expected, actual, path)
 
@@ -154,12 +160,6 @@ def _container_type_mismatch(
     if key_mismatch is not None:
         return key_mismatch
     return _type_mismatch(cast(TypeSpec, expected.value), map_type.item_field.type, f"{path}.value")
-
-
-def _parameterized_arrow_type(spec: TypeSpec) -> pa.DataType:
-    if spec.kind is Kind.TIMESTAMP:
-        return _TIMESTAMP(cast(str, spec.unit), tz=spec.timezone)
-    return pa.decimal128(cast(int, spec.precision), cast(int, spec.scale))
 
 
 def _struct_mismatch(expected: TypeSpec, actual: _StructType, path: str) -> SchemaMismatch | None:

@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import cast
 
-from .case import Kind, TypeSpec, encode_value, float_bits, normalize_value, semantic_key_bytes
-from .result_evidence import DifferenceEvidence
+from ..case import Kind, TypeSpec, encode_value, float_bits, normalize_value, semantic_key_bytes
+from ..evidence import DifferenceEvidence, json_codec, sha256_hex
 
 ValueMismatch = tuple[str, str, DifferenceEvidence]
 
@@ -135,7 +133,7 @@ def _map_mismatch(
             spec, expected, actual, path, "observed map contains a duplicate or invalid key"
         )
     for identity in sorted(set(left) | set(right)):
-        digest = hashlib.sha256(identity).hexdigest()
+        digest = sha256_hex(identity)
         entry_path = f"{path}.entries[sha256={digest}]"
         if identity not in left:
             key = _render(key_spec, right[identity][0])
@@ -210,9 +208,7 @@ def _mismatch(
 def _render(spec: TypeSpec, value: object) -> str:
     try:
         encoded = encode_value(spec, value)
-        return json.dumps(
-            encoded, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
-        )
+        return json_codec.canonical_bytes(encoded).decode("utf-8")
     except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return repr(value)
 

@@ -5,9 +5,9 @@ from typing import Protocol, cast, overload
 
 import pyarrow as pa
 
-from parquity.compare import compare_case
+from parquity.comparison.table import ComparisonResult, compare_case
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.verdicts import ComparisonResult, Verdict
+from parquity.verdicts import Verdict
 
 
 class _ArrayFactory(Protocol):
@@ -108,11 +108,6 @@ def test_semantically_equal_scalar_and_nested_values_return_typed_pass_evidence(
 
     assert result == ComparisonResult(Verdict.PASS, "$", "semantic schema and values match")
     assert result.passed
-    assert result.to_data() == {
-        "verdict": "PASS",
-        "path": "$",
-        "detail": "semantic schema and values match",
-    }
 
 
 def test_schema_type_disagreements_report_distinct_semantic_paths() -> None:

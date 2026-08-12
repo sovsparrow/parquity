@@ -5,21 +5,22 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from .arrow_bridge import case_to_arrow
-from .compare import compare_case
+from .case.arrow import case_to_arrow
+from .comparison.table import ComparisonResult, compare_case
 from .engines.base import (
     EngineReader,
     EngineWriter,
     ProfiledEngineWriter,
     ProviderOperationError,
 )
+from .evidence import EngineVersion, engine_selection_is_valid
 from .model import Case
-from .verdicts import CellResult, ComparisonResult, EngineVersion, MatrixRun, Verdict
-from .writer_profile_contracts import (
+from .profiles import WriterExecutionIdentity, WriterProfileIdentity, WriterProfilePlan
+from .profiles.contracts import (
     WriterProfileContractViolation,
     verify_writer_profile_artifact,
 )
-from .writer_profiles import WriterExecutionIdentity, WriterProfileIdentity, WriterProfilePlan
+from .verdicts import CellResult, MatrixRun, Verdict
 
 
 def run_matrix(
@@ -31,8 +32,8 @@ def run_matrix(
 ) -> MatrixRun:
     writers = tuple(writer_set)
     readers = tuple(reader_set)
-    _validate_writers(writers)
-    _validate_readers(readers)
+    versions = _validate_writers(writers)
+    reader_versions = _validate_readers(readers)
     directory.mkdir(parents=True, exist_ok=True)
     table = case_to_arrow(case)
     results: list[CellResult] = []
@@ -40,9 +41,6 @@ def run_matrix(
     attempts: list[
         tuple[EngineWriter, WriterExecutionIdentity, Path, ProviderOperationError | None]
     ] = []
-    versions = tuple(
-        EngineVersion(writer.identity.name, writer.identity.version) for writer in writers
-    )
     executions = _executions(versions, writer_profiles)
     for writer in writers:
         selected = tuple(item for item in executions if item.writer.name == writer.identity.name)
@@ -77,7 +75,7 @@ def run_matrix(
         tuple(results),
         tuple(files),
         versions,
-        tuple(EngineVersion(reader.identity.name, reader.identity.version) for reader in readers),
+        reader_versions,
         writer_profiles,
     ).normalized((directory,))
 
@@ -187,17 +185,19 @@ def _filename(writer: str, profile: WriterProfileIdentity | None) -> str:
     return f"{writer}.parquet" if profile is None else f"{writer}--{profile.name}.parquet"
 
 
-def _validate_writers(writers: tuple[EngineWriter, ...]) -> None:
-    if not writers:
+def _validate_writers(writers: tuple[EngineWriter, ...]) -> tuple[EngineVersion, ...]:
+    versions = tuple(writer.identity for writer in writers)
+    if engine_selection_is_valid(versions):
+        return versions
+    if not versions:
         raise ValueError("matrix requires at least one writer")
-    names = [writer.identity.name for writer in writers]
-    if len(names) != len(set(names)):
-        raise ValueError("matrix writer names must be unique")
+    raise ValueError("matrix writer names must be unique")
 
 
-def _validate_readers(readers: tuple[EngineReader, ...]) -> None:
-    if not readers:
+def _validate_readers(readers: tuple[EngineReader, ...]) -> tuple[EngineVersion, ...]:
+    versions = tuple(reader.identity for reader in readers)
+    if engine_selection_is_valid(versions):
+        return versions
+    if not versions:
         raise ValueError("matrix requires at least one reader")
-    names = [reader.identity.name for reader in readers]
-    if len(names) != len(set(names)):
-        raise ValueError("matrix reader names must be unique")
+    raise ValueError("matrix reader names must be unique")

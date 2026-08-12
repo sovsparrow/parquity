@@ -2,55 +2,26 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
-from collections.abc import Callable
+from hashlib import sha256
 from importlib import import_module, metadata
 from pathlib import Path
+from shlex import join as shell_join
 from typing import cast
 
 from pytest import CaptureFixture, MonkeyPatch
 
 import parquity.cli as cli
 from parquity.engines import EngineSelection
-from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.result_evidence import DifferenceEvidence
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
-
-
-def _case() -> Case:
-    return Case((Field("value", TypeSpec(Kind.INT32), nullable=False),), ((1,),))
-
-
-def _write_case(path: Path) -> Case:
-    case = _case()
-    path.write_bytes(case.canonical_bytes())
-    return case
-
-
-def _run_generated_script(
-    script: Path, cwd: Path | None = None, env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603 - absolute interpreter executes generated script.
-        [sys.executable, str(script)],
-        cwd=cwd,
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _versions(
-    selection: EngineSelection,
-) -> tuple[tuple[EngineVersion, ...], tuple[EngineVersion, ...]]:
-    writers = tuple(
-        EngineVersion(engine.identity.name, engine.identity.version) for engine in selection.writers
-    )
-    readers = tuple(
-        EngineVersion(engine.identity.name, engine.identity.version) for engine in selection.readers
-    )
-    return writers, readers
+from parquity.evidence import DifferenceEvidence, EngineVersion
+from parquity.generation.search.identity import finding_key
+from parquity.model import Case
+from parquity.runs.bundle import ValidatedRunV2, validate_run
+from parquity.verdicts import CellResult, MatrixRun, Verdict
+from tests.support.cli_output import captured_payload as _payload
+from tests.support.cli_output import run_python_script
+from tests.support.generated_cli import patch_evaluator as _patch_evaluator
+from tests.support.generated_cli import selection_versions as _versions
+from tests.support.generated_cli import write_case as _write_case
 
 
 def _cell(
@@ -145,19 +116,20 @@ def _pass_evaluator(case: Case, directory: Path, selection: EngineSelection) -> 
     return MatrixRun(case.case_id, _complete(selection, ()), (), writers, readers)
 
 
-def _payload(captured: CaptureFixture[str]) -> tuple[dict[str, object], str]:
-    streams = captured.readouterr()
-    payload = cast(dict[str, object], json.loads(streams.out))
-    assert payload["format"] == "parquity.cli.v1"
-    return payload, streams.err
+def _inventory(directory: Path) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (path.relative_to(directory).as_posix(), sha256(path.read_bytes()).hexdigest())
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    )
 
 
-def _patch_evaluator(
-    monkeypatch: MonkeyPatch,
-    evaluator: Callable[[Case, Path, EngineSelection], MatrixRun],
-) -> None:
-    workflow = import_module("parquity.generation.workflow")
-    monkeypatch.setattr(workflow, "evaluate_selected_case", evaluator)
+def _assert_v2_partition(run: ValidatedRunV2) -> None:
+    saved = {finding_key(item.fingerprint) for item in run.run.saved_evidence}
+    manifest_only = {finding_key(item.fingerprint) for item in run.run.manifest_only_evidence}
+    occurrences = {item.key for item in run.run.occurrences}
+    assert saved.isdisjoint(manifest_only)
+    assert saved | manifest_only == occurrences
 
 
 def test_check_no_finding(
@@ -184,12 +156,55 @@ def test_check_and_replay(
     _write_case(case_path)
     destination = tmp_path / "run"
     _patch_evaluator(monkeypatch, _failure_evaluator)
-    assert cli.main(["check", str(case_path), "--out", str(destination)]) == 1
+    assert cli.main(arguments := ["check", str(case_path), "--out", str(destination)]) == 1
     published, stderr = _payload(capsys)
     assert stderr == ""
     assert published["status"] == "RUN_PUBLISHED"
     assert published["finding_count"] == 3
+    summaries = cast(list[dict[str, object]], published["findings"])
+    assert [item["writer"] for item in summaries] == ["pyarrow", "duckdb", "polars"]
+    validated = validate_run(destination)
+    assert isinstance(validated, ValidatedRunV2)
+    _assert_v2_partition(validated)
+    report = (destination / "REPORT.md").read_text()
+    assert (
+        "3 of 7 engine paths failed on the supplied table. A reproducer was saved for each."
+        in report
+        and report.count("```console") == 1
+        and f"```console\n{shell_join(('parquity', *arguments))}\n```" in report
+        and all(value not in report for value in ("CASE_FILE", "FILE_OR_DIR", "OUTPUT_DIR"))
+    )
+    assert "**Writers:**" in report and "**Readers:**" in report
+    assert "| Writer → reader | Failure | Table / location | Reproduce |" in report
+    assert "1 column · int32" in report
+    assert all(child.case.case_id[:12] not in report for child in validated.children)
+    failure_rows = report.split("## Failures", 1)[1].split("## Run details", 1)[0]
+    assert sum(line.startswith("| ") for line in failure_rows.splitlines()) - 1 == 3
+    assert "polars (write)" in failure_rows and "[open](" in failure_rows
+    assert all((child.directory / "REPORT.md").read_bytes() for child in validated.children)
+    child_report = validated.children[0].directory.joinpath("REPORT.md").read_text()
+    assert child_report.startswith("# pyarrow → pyarrow · compare · VALUE\\_MISMATCH")
+    assert "**Table provenance:** Supplied table; no Hypothesis shrink;" in child_report
+    assert "canonical table" in child_report and "canonical Input" not in child_report
+    assert "## Table" in child_report
+    assert "### Parquity replay" in child_report
+    assert "### Provider-only reproduction" in child_report
+    assert "Exit 1 means reproduced; exit 0 means not reproduced" in child_report
+    assert "- **Machine record:** [finding.json](finding.json)" in child_report
+    for hidden in (
+        "Finding ID",
+        "Normalized detail SHA-256",
+        "Discovered Input",
+        "Minimized Input",
+        "Successful reductions",
+        "Occurrence",
+        "Saved replay targets",
+        "Saved target replay",
+        "Evidence basis",
+    ):
+        assert hidden not in child_report
     assert len(tuple((destination / "findings").iterdir())) == 3
+    before_replay = _inventory(destination)
     assert cli.main(["replay", str(destination)]) == 1
     exact, stderr = _payload(capsys)
     assert stderr == ""
@@ -233,6 +248,7 @@ def test_check_and_replay(
     assert cli.main(["replay", str(destination)]) == 0
     absent, _ = _payload(capsys)
     assert (absent["exact"], absent["related"], absent["absent"]) == (0, 0, 3)
+    assert _inventory(destination) == before_replay
 
 
 def test_extracted_reproduce(
@@ -249,7 +265,7 @@ def test_extracted_reproduce(
     working.mkdir()
     environment = os.environ.copy()
     environment["PATH"] = ""
-    completed = _run_generated_script(child / "reproduce.py", working, environment)
+    completed = run_python_script(child / "reproduce.py", working, environment=environment)
     assert completed.returncode == 0
     assert cast(dict[str, object], json.loads(completed.stdout))["status"] in (
         "RELATED_FAILURE",
@@ -263,15 +279,24 @@ def test_fuzz_evidence(
 ) -> None:
     destination = tmp_path / "fuzz-run"
     _patch_evaluator(monkeypatch, _failure_evaluator)
-    exit_code = cli.main(["fuzz", "--examples", "4", "--seed", "23", "--out", str(destination)])
+    arguments = ["fuzz", "--examples", "4", "--seed", "23", "--out", str(destination)]
+    exit_code = cli.main(arguments)
     payload, stderr = _payload(capsys)
     assert exit_code == 1
     assert stderr == ""
     assert payload["status"] == "RUN_PUBLISHED"
     run = cast(dict[str, object], json.loads((destination / "run.json").read_bytes()))
+    assert run["format"] == "parquity.run.v2"
     discovery = cast(dict[str, object], run["discovery"])
     environment = cast(dict[str, object], run["environment"])
     assert discovery == {
+        "examples": 4,
+        "seed": 23,
+        "max_saved": 8,
+        "stop_reason": "EXAMPLE_BOUND_REACHED",
+    }
+    assert (run["evaluated_inputs"], run["executed_checks"]) == (4, 28)
+    assert payload["discovery"] == {
         "examples": 4,
         "seed": 23,
         "max_findings": 8,
@@ -279,7 +304,36 @@ def test_fuzz_evidence(
         "evaluated_cases": 4,
         "evaluated_cells": 28,
     }
-    assert payload["discovery"] == discovery
+    validated = validate_run(destination)
+    assert isinstance(validated, ValidatedRunV2)
+    _assert_v2_partition(validated)
+    report = (destination / "REPORT.md").read_text()
+    expected_command = shell_join(("parquity", *arguments))
+    assert report.count("```console") == 1
+    assert f"```console\n{expected_command}\n```" in report
+    assert all(value not in report for value in ("CASE_FILE", "FILE_OR_DIR", "OUTPUT_DIR"))
+    assert (
+        "Parquity tested 4 generated tables and found 3 distinct failures. "
+        "A reproducer was saved for each." in report
+    )
+    assert "| Writer → reader | Failure | Example table / location | Reproduce |" in report
+    assert "&lt;" not in report and "&gt;" not in report
+    failure_rows = report.split("## Failures", 1)[1].split("## Run details", 1)[0]
+    assert sum(line.startswith("| ") for line in failure_rows.splitlines()) - 1 == 3
+    assert "Seen on 4 generated tables" in failure_rows
+    child_report = validated.children[0].directory.joinpath("REPORT.md").read_text()
+    assert "**Table provenance:** Generated table;" in child_report
+    assert "Hypothesis shrink" in child_report
+    assert (
+        "**Repeated:** Seen on 4 generated tables; this reproducer uses one of them" in child_report
+    )
+    empty_reports = tuple(
+        child.directory.joinpath("REPORT.md").read_text()
+        for child in validated.children
+        if not child.case.rows
+    )
+    assert empty_reports
+    assert all("### Data\n\n_No rows._" in value for value in empty_reports)
     finding_summaries = cast(list[dict[str, object]], payload["findings"])
     assert len(finding_summaries) == payload["finding_count"]
     expected_keys = {"finding_id", "case_id", "writer", "reader", "verdict", "detail"}
@@ -309,7 +363,39 @@ def test_cli_failure_exits(
     assert missing_error["kind"] == "CASE_UNREADABLE"
     assert missing.name in cast(str, missing_error["detail"])
     assert cast(str, missing_error["detail"]) in missing_stderr
+    replay_inputs = (
+        (tmp_path / "missing-evidence", "does not exist"),
+        (tmp_path / "evidence-file", "must be an evidence directory"),
+        (tmp_path / "incomplete-evidence", "contains no run.json, scan.json, or finding.json"),
+        (tmp_path / "conflicting-evidence", "conflicting run.json and scan.json"),
+        (tmp_path / "malformed-finding", "finding.json is malformed"),
+        (tmp_path / "unreadable-finding", "finding.json could not be read"),
+        (tmp_path / "unsupported-finding", "finding format is not supported"),
+    )
+    replay_inputs[1][0].write_text("not a directory")
+    replay_inputs[2][0].mkdir()
+    for index, payloads in ((3, ("run.json", "scan.json")), (4, ("finding.json",))):
+        replay_inputs[index][0].mkdir()
+        for name in payloads:
+            (replay_inputs[index][0] / name).write_text("{")
+    replay_inputs[5][0].mkdir()
+    (replay_inputs[5][0] / "finding.json").mkdir()
+    replay_inputs[6][0].mkdir()
+    (replay_inputs[6][0] / "finding.json").write_text('{"format":"unknown"}')
+    main_module = import_module("parquity.cli.main")
 
+    def unexpected_selection(*_: object) -> object:
+        raise AssertionError("invalid replay target reached engine resolution")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(main_module, "resolve_engine_selection", unexpected_selection)
+        for replay_input, expected in replay_inputs:
+            assert cli.main(["replay", str(replay_input)]) == 2
+            rejected, rejected_stderr = _payload(capsys)
+            rejected_error = cast(dict[str, object], rejected["error"])
+            detail = cast(str, rejected_error["detail"])
+            assert rejected_error["kind"] == "INVALID_BUNDLE"
+            assert expected in detail and detail in rejected_stderr
     case_path = tmp_path / "case.json"
     _write_case(case_path)
     destination = tmp_path / "run"

@@ -9,7 +9,7 @@ from ..engines.base import EngineReader, EngineWriter
 from ..matrix import run_matrix
 from ..model import Case, Field, Kind, TypeSpec
 from ..verdicts import MatrixRun
-from .output import emit, failure
+from .output import availability_data, emit, failure
 
 ResolveEngines = Callable[[Sequence[str]], tuple[EngineResolution, ...]]
 
@@ -22,7 +22,7 @@ def run_smoke(resolve_engines: ResolveEngines) -> int:
     unavailable: list[object] = []
     for resolution in resolutions:
         if not resolution.availability.available:
-            unavailable.append(resolution.availability.to_data())
+            unavailable.append(availability_data(resolution.availability))
         elif resolution.writer is None or resolution.reader is None:
             raise TypeError("core engine resolution is missing a declared direction")
         else:
@@ -42,7 +42,7 @@ def run_smoke(resolve_engines: ResolveEngines) -> int:
         return 2
     with tempfile.TemporaryDirectory(prefix="parquity-smoke-") as raw_directory:
         run = execute_smoke(Path(raw_directory), writers, readers)
-    emit({"command": "smoke", **run.to_data()})
+    emit({"command": "smoke", **_matrix_data(run)})
     return 0 if not run.failures else 1
 
 
@@ -52,6 +52,19 @@ def execute_smoke(
     readers: Sequence[EngineReader],
 ) -> MatrixRun:
     return run_matrix(_smoke_case(), directory, writers, readers)
+
+
+def _matrix_data(run: MatrixRun) -> dict[str, object]:
+    data: dict[str, object] = {
+        "case_id": run.case_id,
+        "status": run.status,
+        "writers": [engine.to_data() for engine in run.writers],
+        "readers": [engine.to_data() for engine in run.readers],
+        "results": [result.to_data() for result in run.results],
+    }
+    if run.writer_profiles is not None:
+        data["writer_profiles"] = run.writer_profiles.to_data()
+    return data
 
 
 def _smoke_case() -> Case:

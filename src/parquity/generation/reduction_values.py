@@ -12,9 +12,9 @@ from ..model import Case, Field, Kind, TypeSpec
 
 def container_cases(case: Case) -> Iterator[Case]:
     for index, field in enumerate(case.fields):
-        values = _column(case, index)
+        values = case_column(case, index)
         for type_spec, replacements in _container_variants(field.type_spec, values):
-            candidate = _replace_field(
+            candidate = replace_case_field(
                 case, index, replace(field, type_spec=type_spec), replacements
             )
             if candidate is not None:
@@ -100,7 +100,7 @@ def _struct_container_variants(
                 None if value is None else {**_mapping(value), field.name: next(replacement_iter)}
                 for value in values
             )
-            fields = _replace_tuple(spec.fields, index, replace(field, type_spec=child_spec))
+            fields = replace_tuple_item(spec.fields, index, replace(field, type_spec=child_spec))
             yield replace(spec, fields=fields), rebuilt
 
 
@@ -197,8 +197,13 @@ def _same_scalar(spec: TypeSpec, left: object, right: object) -> bool:
     return left == right
 
 
-def _replace_field(case: Case, index: int, field: Field, values: tuple[object, ...]) -> Case | None:
-    fields = _replace_tuple(case.fields, index, field)
+def replace_case_field(
+    case: Case,
+    index: int,
+    field: Field,
+    values: tuple[object, ...],
+) -> Case | None:
+    fields = replace_tuple_item(case.fields, index, field)
     rows = tuple(
         (*row[:index], value, *row[index + 1 :])
         for row, value in zip(case.rows, values, strict=True)
@@ -209,11 +214,11 @@ def _replace_field(case: Case, index: int, field: Field, values: tuple[object, .
         return None
 
 
-def _replace_tuple(values: tuple[Field, ...], index: int, value: Field) -> tuple[Field, ...]:
+def replace_tuple_item(values: tuple[Field, ...], index: int, value: Field) -> tuple[Field, ...]:
     return (*values[:index], value, *values[index + 1 :])
 
 
-def _column(case: Case, index: int) -> tuple[object, ...]:
+def case_column(case: Case, index: int) -> tuple[object, ...]:
     return tuple(row[index] for row in case.rows)
 
 
@@ -238,4 +243,10 @@ def _mapping(value: object) -> Mapping[str, object]:
     return cast(Mapping[str, object], value)
 
 
-__all__ = ["container_cases", "scalar_cases"]
+__all__ = [
+    "case_column",
+    "container_cases",
+    "replace_case_field",
+    "replace_tuple_item",
+    "scalar_cases",
+]

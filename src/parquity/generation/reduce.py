@@ -4,16 +4,28 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import cast
 
-from ..model import Case, Field, Kind, TypeSpec
-from ..verdicts import FailureFingerprint, MatrixRun
-from .reduction_values import container_cases, scalar_cases
+from ..model import Case, Kind, TypeSpec
+from ..verdicts import CellResult, FailureFingerprint, MatrixRun
+from .reduction_values import (
+    case_column,
+    container_cases,
+    replace_case_field,
+    replace_tuple_item,
+    scalar_cases,
+)
 
 Evaluate = Callable[[Case], MatrixRun]
 CandidateAdmission = Callable[[Case], bool]
+ObservationAdmission = Callable[[Case, CellResult], bool]
 
 
 def admit_every_candidate(case: Case) -> bool:
     del case
+    return True
+
+
+def admit_every_observation(case: Case, result: CellResult) -> bool:
+    del case, result
     return True
 
 
@@ -53,6 +65,7 @@ def reduce_case(
     fingerprint: FailureFingerprint,
     evaluate: Evaluate,
     candidate_admission: CandidateAdmission = admit_every_candidate,
+    observation_admission: ObservationAdmission = admit_every_observation,
 ) -> StructuralReduction:
     current_case = case
     current_run = run
@@ -75,6 +88,7 @@ def reduce_case(
                 evaluate,
                 candidates,
                 candidate_admission,
+                observation_admission,
                 accepted_states,
             )
             values[name] += accepted
@@ -91,6 +105,7 @@ def _reduce_category(
     evaluate: Evaluate,
     candidates: Callable[[Case], Iterator[Case]],
     candidate_admission: CandidateAdmission,
+    observation_admission: ObservationAdmission,
     accepted_states: set[bytes],
 ) -> tuple[Case, MatrixRun, int]:
     accepted = 0
@@ -103,7 +118,15 @@ def _reduce_category(
             if candidate_bytes == case.canonical_bytes():
                 continue
             candidate_run = evaluate(candidate)
-            if any(result.fingerprint == fingerprint for result in candidate_run.failures):
+            result = next(
+                (
+                    item
+                    for item in candidate_run.distinct_failures
+                    if item.fingerprint == fingerprint
+                ),
+                None,
+            )
+            if result is not None and observation_admission(candidate, result):
                 if candidate_bytes in accepted_states:
                     raise RuntimeError("structural reduction cycle detected")
                 accepted_states.add(candidate_bytes)
@@ -131,13 +154,13 @@ def _row_cases(case: Case) -> Iterator[Case]:
 
 def _nullability_cases(case: Case) -> Iterator[Case]:
     for index, field in enumerate(case.fields):
-        values = _column(case, index)
+        values = case_column(case, index)
         if field.nullable:
-            candidate = _replace_field(case, index, replace(field, nullable=False), values)
+            candidate = replace_case_field(case, index, replace(field, nullable=False), values)
             if candidate is not None:
                 yield candidate
         for type_spec in _type_nullability_variants(field.type_spec):
-            candidate = _replace_field(case, index, replace(field, type_spec=type_spec), values)
+            candidate = replace_case_field(case, index, replace(field, type_spec=type_spec), values)
             if candidate is not None:
                 yield candidate
 
@@ -161,10 +184,10 @@ def _list_nullability_variants(spec: TypeSpec) -> Iterator[TypeSpec]:
 def _struct_nullability_variants(spec: TypeSpec) -> Iterator[TypeSpec]:
     for index, field in enumerate(spec.fields):
         if field.nullable:
-            fields = _replace_tuple(spec.fields, index, replace(field, nullable=False))
+            fields = replace_tuple_item(spec.fields, index, replace(field, nullable=False))
             yield replace(spec, fields=fields)
         for child in _type_nullability_variants(field.type_spec):
-            fields = _replace_tuple(spec.fields, index, replace(field, type_spec=child))
+            fields = replace_tuple_item(spec.fields, index, replace(field, type_spec=child))
             yield replace(spec, fields=fields)
 
 
@@ -177,35 +200,12 @@ def _map_nullability_variants(spec: TypeSpec) -> Iterator[TypeSpec]:
         yield replace(spec, value=value)
 
 
-def _replace_field(
-    case: Case,
-    index: int,
-    field: Field,
-    values: tuple[object, ...],
-) -> Case | None:
-    fields = _replace_tuple(case.fields, index, field)
-    rows = tuple(
-        (*row[:index], value, *row[index + 1 :])
-        for row, value in zip(case.rows, values, strict=True)
-    )
-    try:
-        return Case(fields, rows)
-    except ValueError:
-        return None
-
-
-def _replace_tuple(values: tuple[Field, ...], index: int, value: Field) -> tuple[Field, ...]:
-    return (*values[:index], value, *values[index + 1 :])
-
-
-def _column(case: Case, index: int) -> tuple[object, ...]:
-    return tuple(row[index] for row in case.rows)
-
-
 __all__ = [
     "CandidateAdmission",
+    "ObservationAdmission",
     "ReductionCounts",
     "StructuralReduction",
     "admit_every_candidate",
+    "admit_every_observation",
     "reduce_case",
 ]

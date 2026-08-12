@@ -1,22 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
-from importlib import import_module
 from pathlib import Path
-from typing import cast
 
-
-class Command(StrEnum):
-    CHECK = "check"
-    ENGINES = "engines"
-    FUZZ = "fuzz"
-    HELP = "help"
-    REPLAY = "replay"
-    SCAN = "scan"
-    SMOKE = "smoke"
-    TRIAGE = "triage"
-    VERSION = "version"
+from ..configuration import (
+    fuzz_examples_is_valid,
+    fuzz_saved_limit_is_valid,
+    fuzz_seed_is_valid,
+)
+from .spec import (
+    CHECK,
+    ENGINES,
+    EXAMPLES,
+    FUZZ,
+    FUZZ_MAX_SAVED,
+    HELP_COMMANDS,
+    HELP_FLAGS,
+    JSON,
+    OUT,
+    READERS,
+    SCAN,
+    SCAN_MAX_SAVED,
+    SCAN_TIMEOUT,
+    SCHEMA,
+    SEED,
+    VERSION_FLAG,
+    WRITER_PROFILES,
+    WRITERS,
+    Command,
+    OptionSpec,
+)
 
 
 class UsageError(ValueError):
@@ -38,7 +51,7 @@ class FuzzArguments:
     destination: Path
     examples: int
     seed: int
-    max_findings: int
+    max_saved: int
     writers: str | None
     readers: str | None
     writer_profiles: str | None
@@ -50,14 +63,7 @@ class ScanArguments:
     destination: Path
     engines: str | None
     timeout: int
-    max_findings: int
-
-
-@dataclass(frozen=True, slots=True)
-class TriageArguments:
-    directory: Path
-    focus: str
-    replay_evidence: Path | None
+    max_saved: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,41 +71,35 @@ class HelpArguments:
     command: str | None
 
 
-ParsedArguments = (
-    CheckArguments | FuzzArguments | HelpArguments | ScanArguments | TriageArguments | Path | None
-)
-
-_HELP_COMMANDS = ("engines", "smoke", "check", "fuzz", "scan", "replay", "triage")
+ParsedArguments = CheckArguments | FuzzArguments | HelpArguments | ScanArguments | Path | None
 
 
 def extract_json_flag(arguments: tuple[str, ...]) -> tuple[bool, tuple[str, ...]]:
-    count = arguments.count("--json")
+    count = arguments.count(JSON.name)
     if count > 1:
-        raise UsageError("--json appears more than once")
-    return count == 1, tuple(value for value in arguments if value != "--json")
+        raise UsageError(f"{JSON.name} appears more than once")
+    return count == 1, tuple(value for value in arguments if value != JSON.name)
 
 
 def parse(arguments: tuple[str, ...]) -> tuple[Command, ParsedArguments]:
     simple: dict[tuple[str, ...], Command] = {
-        ("--version",): Command.VERSION,
-        ("engines",): Command.ENGINES,
-        ("smoke",): Command.SMOKE,
+        (VERSION_FLAG,): Command.VERSION,
+        (Command.ENGINES.value,): Command.ENGINES,
+        (Command.SMOKE.value,): Command.SMOKE,
     }
-    if arguments in (("--help",), ("-h",)):
+    if arguments in tuple((flag,) for flag in HELP_FLAGS):
         return Command.HELP, HelpArguments(None)
-    if len(arguments) == 2 and arguments[1] in ("--help", "-h") and arguments[0] in _HELP_COMMANDS:
+    if len(arguments) == 2 and arguments[1] in HELP_FLAGS and arguments[0] in HELP_COMMANDS:
         return Command.HELP, HelpArguments(arguments[0])
     if command := simple.get(arguments):
         return command, None
-    if arguments[:1] == ("check",):
+    if arguments[:1] == (Command.CHECK.value,):
         return Command.CHECK, _check_arguments(arguments)
-    if arguments[:1] == ("fuzz",):
+    if arguments[:1] == (Command.FUZZ.value,):
         return Command.FUZZ, _fuzz_arguments(arguments)
-    if arguments[:1] == ("scan",):
+    if arguments[:1] == (Command.SCAN.value,):
         return Command.SCAN, _scan_arguments(arguments)
-    if arguments[:1] == ("triage",):
-        return Command.TRIAGE, _triage_arguments(arguments)
-    if len(arguments) == 2 and arguments[0] == "replay":
+    if len(arguments) == 2 and arguments[0] == Command.REPLAY.value:
         return Command.REPLAY, Path(arguments[1])
     raise UsageError("invalid arguments; run 'parquity --help'")
 
@@ -109,60 +109,49 @@ def _check_arguments(arguments: tuple[str, ...]) -> CheckArguments:
         raise UsageError("check requires CASE_FILE and --out OUTPUT_DIR")
     options = _options(
         arguments[2:],
-        allowed=("--out", "--writers", "--readers", "--writer-profiles"),
-        required=("--out",),
+        allowed=CHECK.option_names,
+        required=CHECK.required_names,
         command="check",
     )
     return CheckArguments(
         Path(arguments[1]),
-        Path(options["--out"]),
-        options.get("--writers"),
-        options.get("--readers"),
-        options.get("--writer-profiles"),
+        Path(options[OUT.name]),
+        options.get(WRITERS.name),
+        options.get(READERS.name),
+        options.get(WRITER_PROFILES.name),
     )
 
 
 def _fuzz_arguments(arguments: tuple[str, ...]) -> FuzzArguments:
-    bounds = import_module("parquity.generation")
-    default_max_findings = cast(int, vars(bounds)["DEFAULT_MAX_FINDINGS"])
-    max_findings_limit = cast(int, vars(bounds)["MAX_FINDINGS"])
-    max_seed = cast(int, vars(bounds)["MAX_SEED"])
-
     options = _options(
         arguments[1:],
-        allowed=(
-            "--examples",
-            "--seed",
-            "--schema",
-            "--out",
-            "--max-findings",
-            "--writers",
-            "--readers",
-            "--writer-profiles",
-        ),
-        required=("--examples", "--seed", "--out"),
+        allowed=FUZZ.option_names,
+        required=FUZZ.required_names,
         command="fuzz",
     )
-    examples = _integer(options["--examples"], "--examples")
-    seed = _integer(options["--seed"], "--seed")
-    max_findings = _integer(
-        options.get("--max-findings", str(default_max_findings)), "--max-findings"
+    examples = _integer(options[EXAMPLES.name], EXAMPLES.name)
+    seed = _integer(options[SEED.name], SEED.name)
+    max_saved = _integer(
+        options.get(FUZZ_MAX_SAVED.name, _default(FUZZ_MAX_SAVED)),
+        FUZZ_MAX_SAVED.name,
     )
-    if examples < 1:
+    if not fuzz_examples_is_valid(examples):
         raise UsageError("--examples must be positive")
-    if not 0 <= seed <= max_seed:
-        raise UsageError(f"--seed must be in [0, {max_seed}]")
-    if not 1 <= max_findings <= max_findings_limit:
-        raise UsageError(f"--max-findings must be in [1, {max_findings_limit}]")
+    if not fuzz_seed_is_valid(seed):
+        raise UsageError(f"--seed must be in [{SEED.minimum}, {SEED.maximum}]")
+    if not fuzz_saved_limit_is_valid(max_saved):
+        raise UsageError(
+            f"--max-saved must be in [{FUZZ_MAX_SAVED.minimum}, {FUZZ_MAX_SAVED.maximum}]"
+        )
     return FuzzArguments(
-        None if "--schema" not in options else Path(options["--schema"]),
-        Path(options["--out"]),
+        None if SCHEMA.name not in options else Path(options[SCHEMA.name]),
+        Path(options[OUT.name]),
         examples,
         seed,
-        max_findings,
-        options.get("--writers"),
-        options.get("--readers"),
-        options.get("--writer-profiles"),
+        max_saved,
+        options.get(WRITERS.name),
+        options.get(READERS.name),
+        options.get(WRITER_PROFILES.name),
     )
 
 
@@ -171,39 +160,28 @@ def _scan_arguments(arguments: tuple[str, ...]) -> ScanArguments:
         raise UsageError("scan requires FILE_OR_DIR and --out")
     options = _options(
         arguments[2:],
-        allowed=("--engines", "--timeout", "--max-findings", "--out"),
-        required=("--out",),
+        allowed=SCAN.option_names,
+        required=SCAN.required_names,
         command="scan",
     )
-    timeout = _integer(options.get("--timeout", "30"), "--timeout")
-    max_findings = _integer(options.get("--max-findings", "32"), "--max-findings")
-    if not 1 <= timeout <= 300:
-        raise UsageError("--timeout must be in [1, 300]")
-    if not 1 <= max_findings <= 64:
-        raise UsageError("--max-findings must be in [1, 64]")
+    timeout = _integer(options.get(SCAN_TIMEOUT.name, _default(SCAN_TIMEOUT)), SCAN_TIMEOUT.name)
+    max_saved = _integer(
+        options.get(SCAN_MAX_SAVED.name, _default(SCAN_MAX_SAVED)),
+        SCAN_MAX_SAVED.name,
+    )
+    if not _within(timeout, SCAN_TIMEOUT):
+        raise UsageError(f"--timeout must be in [{SCAN_TIMEOUT.minimum}, {SCAN_TIMEOUT.maximum}]")
+    if not _within(max_saved, SCAN_MAX_SAVED):
+        raise UsageError(
+            f"--max-saved must be in [{SCAN_MAX_SAVED.minimum}, {SCAN_MAX_SAVED.maximum}]"
+        )
     return ScanArguments(
         Path(arguments[1]),
-        Path(options["--out"]),
-        options.get("--engines"),
+        Path(options[OUT.name]),
+        options.get(ENGINES.name),
         timeout,
-        max_findings,
+        max_saved,
     )
-
-
-def _triage_arguments(arguments: tuple[str, ...]) -> TriageArguments:
-    if len(arguments) < 2:
-        raise UsageError("triage requires RUN_DIR")
-    options = _options(
-        arguments[2:],
-        allowed=("--focus", "--replay-evidence"),
-        required=(),
-        command="triage",
-    )
-    focus = options.get("--focus", "all")
-    if focus not in ("all", "execution", "data", "schema"):
-        raise UsageError("--focus must be all, execution, data, or schema")
-    replay = options.get("--replay-evidence")
-    return TriageArguments(Path(arguments[1]), focus, None if replay is None else Path(replay))
 
 
 def _options(
@@ -234,3 +212,13 @@ def _integer(value: str, name: str) -> int:
         return int(value)
     except ValueError as error:
         raise UsageError(f"{name} must be an integer") from error
+
+
+def _default(option: OptionSpec) -> str:
+    if option.default is None:
+        raise TypeError("CLI option has no default")
+    return option.default
+
+
+def _within(value: int, option: OptionSpec) -> bool:
+    return option.accepts(value)

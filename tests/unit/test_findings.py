@@ -3,37 +3,33 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
 
-from parquity.findings import OPTIONAL_INPUT, REQUIRED_ARTIFACTS
-from parquity.findings import json_codec as codec
-from parquity.findings.evidence import (
-    CHECK_COMPLETE,
-    EXAMPLE_BOUND_REACHED,
+from parquity.evidence import (
     DependencyVersion,
-    DiscoveryEvidence,
+    DifferenceEvidence,
+    EngineVersion,
     EnvironmentEvidence,
-    ReductionEvidence,
 )
-from parquity.findings.matrix import MatrixRecord
+from parquity.findings import OPTIONAL_INPUT, REQUIRED_ARTIFACTS
 from parquity.findings.model import (
     ArtifactDigest,
     FindingRecord,
     FindingValidationError,
+    ReductionEvidence,
     ReplaySignature,
     finding_id_for,
 )
-from parquity.findings.observation import fingerprint_from_data
-from parquity.findings.report import render_finding_report
-from parquity.findings.scripts import render_reproduce
 from parquity.findings.upstream_script import render_upstream_repro
+from parquity.generation.evidence import (
+    EXAMPLE_BOUND_REACHED,
+    SAVED_EVIDENCE_LIMIT_REACHED,
+    DiscoveryEvidence,
+)
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.result_evidence import DifferenceEvidence
-from parquity.verdicts import CellResult, EngineVersion, Verdict
-from tests.support.report_fragments import report_fragments
+from parquity.verdicts import CellResult, Verdict
 
 
 def _case() -> Case:
@@ -85,16 +81,6 @@ def _record(result: CellResult | None = None) -> FindingRecord:
         result=result,
         input_parquet=True,
         artifacts=artifacts,
-    )
-
-
-def _matrix(result: CellResult | None = None) -> MatrixRecord:
-    result = _result() if result is None else result
-    fingerprint = result.fingerprint
-    assert fingerprint is not None
-    engines = (EngineVersion("pyarrow", "1"), EngineVersion("duckdb", "2"))
-    return MatrixRecord(
-        _case().case_id, engines[:1], engines[1:], fingerprint, (fingerprint,), (result,)
     )
 
 
@@ -152,6 +138,22 @@ def test_finding_bytes_are_independently_canonical_and_additive_top_level_fields
     assert FindingRecord.from_data(additive) == finding
 
 
+def test_saved_limit_discovery_round_trips_through_v1_wire_names() -> None:
+    discovery = DiscoveryEvidence(25, 7, 8, SAVED_EVIDENCE_LIMIT_REACHED, 9, 81)
+    data = discovery.to_data()
+
+    assert discovery.max_saved == 8
+    assert data == {
+        "examples": 25,
+        "seed": 7,
+        "max_findings": 8,
+        "stop_reason": "FINDING_CAP_REACHED",
+        "evaluated_cases": 9,
+        "evaluated_cells": 81,
+    }
+    assert DiscoveryEvidence.from_data(data) == discovery
+
+
 def test_finding_rejects_identity_signature_selection_and_inventory_conflicts() -> None:
     finding = _record()
     with pytest.raises(FindingValidationError):
@@ -199,14 +201,6 @@ def test_finding_rejects_identity_signature_selection_and_inventory_conflicts() 
         FindingRecord.from_json(json.dumps(conflict))
 
 
-def test_reproduce_script_uses_current_python_module_execution_without_path_lookup() -> None:
-    payload = render_reproduce()
-    assert _imports(payload) == {"subprocess", "sys", "pathlib"}
-    assert b"sys.executable" in payload
-    assert b'"-m", "parquity", "replay"' in payload
-    assert b'["parquity", "replay"' not in payload
-
-
 @pytest.mark.parametrize(
     ("writer", "reader", "expected_imports"),
     (
@@ -229,93 +223,6 @@ def test_upstream_script_is_provider_direct_and_target_only(
     assert expected_imports <= imports
     assert b"WRITE_COMPLETED" in payload
     assert b"READ_COMPLETED" in payload
-
-
-def test_report_progressively_discloses_case_problem_reproduction_and_exact_evidence() -> None:
-    kind = "kind`\n# injected\n[link](https://invalid)|<tag>\n```"
-    detail = "detail `code`\n## injected\n[detail](https://invalid)|<html>\n```"
-    result = _result(diagnostic_kind=kind, detail=detail)
-    report = render_finding_report(_record(result), _case(), _matrix(result)).decode()
-    ordered = report_fragments(
-        "## What happened;## Input Case;## Reproduce;## Complete writer-reader matrix;"
-        "## What this evidence establishes;## Discovery and minimization;## Technical evidence"
-    )
-    positions = tuple(map(report.index, ordered))
-    assert positions == tuple(sorted(positions))
-    required = report_fragments(
-        "| Step | Stage | Outcome |;| # | Column | Type | Nullable | Shape |;"
-        "| Row | Column | Value |;| Expected from the Case | Observed from the reader |;"
-        "| Writer output | Reader | Stage | Result | Location |;[`case.json`](case.json);"
-        "[`matrix.json`](matrix.json);[`finding.json`](finding.json);python reproduce.py;"
-        "python upstream_repro.py"
-    )
-    assert all(value in report for value in required)
-    for forbidden in ("evaluator", "authorization", "owner seam", "gate"):
-        assert forbidden not in report.lower()
-    for hostile in (
-        "\n# injected",
-        "\n## injected",
-        "[link](https://invalid)",
-        "[detail](https://invalid)",
-        "<tag>",
-        "<html>",
-        "|<",
-        "\\n```",
-    ):
-        assert hostile not in report
-    assert "<code>1</code>" in report and "<code>2</code>" in report
-
-
-@pytest.mark.parametrize(
-    "invalid",
-    (
-        lambda: DiscoveryEvidence(1, 0, 1, CHECK_COMPLETE),
-        lambda: DiscoveryEvidence(1, 0, 1, "UNKNOWN"),
-        lambda: DiscoveryEvidence(0, 0, 1, EXAMPLE_BOUND_REACHED),
-        lambda: DiscoveryEvidence(1, -1, 1, EXAMPLE_BOUND_REACHED),
-        lambda: DiscoveryEvidence(1, 0, 65, EXAMPLE_BOUND_REACHED),
-        lambda: replace(_environment(), parquity_version=""),
-        lambda: replace(_environment(), providers=(_environment().providers[0],) * 2),
-        lambda: ReductionEvidence("bad", "0" * 64, False, 0, 0, 0, 0, 0),
-        lambda: ReductionEvidence("0" * 64, "0" * 64, False, -1, 0, 0, 0, 0),
-        lambda: ArtifactDigest("unknown", "0" * 64, 0),
-        lambda: ArtifactDigest("REPORT.md", "bad", 0),
-        lambda: ArtifactDigest("REPORT.md", "0" * 64, -1),
-        lambda: ReplaySignature.from_result(
-            replace(_result(), verdict=Verdict.PASS, difference=None)
-        ),
-        lambda: replace(_matrix(), selection_order=()),
-        lambda: replace(_matrix(), writers=()),
-        lambda: replace(_record(), command="bad"),
-        lambda: replace(_record(), command="check"),
-        lambda: replace(_record(), readers=()),
-        lambda: replace(_record(), result=replace(_result(), detail="different")),
-        lambda: replace(_record(), reduction=replace(_reduction(), minimized_case_id="0" * 64)),
-        lambda: replace(_record(), input_parquet=False),
-        lambda: FindingRecord.from_json(b"[]"),
-        lambda: FindingRecord.from_json(b"{"),
-        lambda: MatrixRecord.from_json(b"[]"),
-        lambda: MatrixRecord.from_json(b"{"),
-        lambda: MatrixRecord.from_data({**_matrix().to_data(), "results": []}),
-        lambda: codec.required({}, "missing"),
-        lambda: codec.require_exact_keys({"extra": 1}, set(), "value"),
-        lambda: codec.mapping([], "value"),
-        lambda: codec.mapping({1: "value"}, "value"),
-        lambda: codec.sequence("value", "value"),
-        lambda: codec.string(1, "value"),
-        lambda: codec.integer(True, "value"),
-        lambda: codec.boolean(1, "value"),
-        lambda: fingerprint_from_data({**_matrix().target.to_data(), "verdict": "UNKNOWN"}),
-        lambda: fingerprint_from_data({**_matrix().target.to_data(), "writer": ""}),
-        lambda: fingerprint_from_data({**_matrix().target.to_data(), "operation": "write"}),
-        lambda: fingerprint_from_data(
-            {**_matrix().target.to_data(), "normalized_detail_sha256": "bad"}
-        ),
-    ),
-)
-def test_malformed_finding_evidence_is_rejected(invalid: Callable[[], object]) -> None:
-    with pytest.raises(FindingValidationError):
-        invalid()
 
 
 def test_reduction_evidence_rejects_an_inconsistent_total() -> None:

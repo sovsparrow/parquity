@@ -2,22 +2,15 @@ from __future__ import annotations
 
 import tempfile
 from dataclasses import dataclass
-from enum import StrEnum
 from importlib import metadata
 from pathlib import Path
 
-from ..generation import CaseEvaluator
-from ..verdicts import CellResult, EngineVersion, MatrixRun
-from ..writer_profiles import WriterProfilePlan
-from .bundle import ValidatedBundle, validate_bundle
-from .evidence import DependencyVersion
+from ..evidence import DependencyVersion, EngineVersion, ReplayClassification
+from ..model import Case
+from ..profiles import WriterProfilePlan
+from ..verdicts import CaseEvaluator, FailureFingerprint, MatrixRun
+from .bundle import ValidatedBundle
 from .model import FindingRecord, ReplaySignature
-
-
-class ReplayClassification(StrEnum):
-    REPRODUCED = "REPRODUCED"
-    RELATED_FAILURE = "RELATED_FAILURE"
-    NOT_REPRODUCED = "NOT_REPRODUCED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +80,7 @@ class DependencyDrift:
 @dataclass(frozen=True, slots=True)
 class ReplayOutcome:
     finding: FindingRecord
-    run: MatrixRun
     classification: ReplayClassification
-    matched: CellResult | None
     version_evidence: tuple[VersionEvidence, ...]
     version_drift: tuple[VersionDrift, ...]
     dependency_evidence: tuple[DependencyEvidence, ...]
@@ -100,43 +91,43 @@ class ReplayOutcome:
         return self.classification is ReplayClassification.REPRODUCED
 
 
-def replay_bundle(directory: Path, evaluator: CaseEvaluator) -> ReplayOutcome:
-    return replay_validated_bundle(validate_bundle(directory), evaluator)
-
-
 def replay_validated_bundle(
     validated: ValidatedBundle,
     evaluator: CaseEvaluator,
 ) -> ReplayOutcome:
-    with tempfile.TemporaryDirectory(prefix="parquity-replay-") as raw_directory:
-        root = Path(raw_directory)
-        run = evaluator(validated.case, root / "evaluation").normalized((root,))
-    if run.case_id != validated.case.case_id:
-        raise RuntimeError("replay evaluation returned a conflicting Case identity")
+    run = _evaluate_case(validated.case, evaluator)
     require_replay_profile_plan(validated.finding.writer_profiles, run.writer_profiles)
-    classification, matched = _classify(validated.finding.replay_signature, run)
-    evidence = _version_evidence(validated.finding, run)
-    drift = tuple(
+    fingerprint = validated.finding.fingerprint
+    classification = _classify(ReplaySignature.from_fingerprint(fingerprint), run)
+    version_evidence = _version_evidence(fingerprint, run)
+    version_drift = tuple(
         VersionDrift(item.role, item.engine, item.original, item.current)
-        for item in evidence
+        for item in version_evidence
         if item.current is not None and item.current != item.original
     )
-    dependencies = _dependency_evidence(validated.finding.environment.dependencies)
+    dependency_evidence = _dependency_evidence(validated.finding.environment.dependencies)
     dependency_drift = tuple(
         DependencyDrift(item.package, item.original, item.current)
-        for item in dependencies
+        for item in dependency_evidence
         if item.current is not None and item.current != item.original
     )
     return ReplayOutcome(
         validated.finding,
-        run,
         classification,
-        matched,
-        evidence,
-        drift,
-        dependencies,
+        version_evidence,
+        version_drift,
+        dependency_evidence,
         dependency_drift,
     )
+
+
+def _evaluate_case(case: Case, evaluator: CaseEvaluator) -> MatrixRun:
+    with tempfile.TemporaryDirectory(prefix="parquity-replay-") as raw_directory:
+        root = Path(raw_directory)
+        run = evaluator(case, root / "evaluation").normalized((root,))
+    if run.case_id != case.case_id:
+        raise RuntimeError("replay evaluation returned a conflicting Case identity")
+    return run
 
 
 def require_replay_profile_plan(
@@ -154,14 +145,14 @@ def require_replay_profile_plan(
 def _classify(
     target: ReplaySignature,
     run: MatrixRun,
-) -> tuple[ReplayClassification, CellResult | None]:
+) -> ReplayClassification:
     failures = tuple(result for result in run.failures if result.fingerprint is not None)
     exact = next(
         (result for result in failures if ReplaySignature.from_result(result) == target),
         None,
     )
     if exact is not None:
-        return ReplayClassification.REPRODUCED, exact
+        return ReplayClassification.REPRODUCED
     related = next(
         (
             result
@@ -171,14 +162,16 @@ def _classify(
         None,
     )
     if related is not None:
-        return ReplayClassification.RELATED_FAILURE, related
-    return ReplayClassification.NOT_REPRODUCED, None
+        return ReplayClassification.RELATED_FAILURE
+    return ReplayClassification.NOT_REPRODUCED
 
 
-def _version_evidence(finding: FindingRecord, run: MatrixRun) -> tuple[VersionEvidence, ...]:
+def _version_evidence(
+    fingerprint: FailureFingerprint,
+    run: MatrixRun,
+) -> tuple[VersionEvidence, ...]:
     current_writers = _versions(run.writers, run, "writer")
     current_readers = _versions(run.readers, run, "reader")
-    fingerprint = finding.fingerprint
     evidence = [
         VersionEvidence(
             "writer",
@@ -243,7 +236,6 @@ __all__ = [
     "ReplayOutcome",
     "VersionDrift",
     "VersionEvidence",
-    "replay_bundle",
     "replay_validated_bundle",
     "require_replay_profile_plan",
 ]

@@ -13,9 +13,10 @@ Case -> selected writer -> Parquet bytes -> selected reader -> compare with Case
 ```
 
 Generic `fuzz` creates Cases. Schema-aware `fuzz` takes an empty Case as a
-schema template, then generates rows under it. Generated findings and replay
-use the same `parquity.case.v1` JSON format. Use `scan` instead when you already
-have Parquet bytes and want to compare readers without an expected Case.
+schema template, then generates rows under it. Saved generated reproducers use
+the same `parquity.case.v1` JSON format, so their `case.json` can be passed
+directly to `check`. Use `scan` instead when you already have Parquet bytes and
+want to compare readers without an expected Case.
 
 ## Smallest useful example
 
@@ -46,7 +47,10 @@ parquity check case.json --out check-run
 ```
 
 Each selected writer serializes those rows. Each selected reader reads the
-result, and Parquity compares its observed schema and values with the Case.
+result, and Parquity compares its observed schema and values with the Case. If
+a path fails, Parquity may reduce the supplied Case to a smaller table that
+preserves the same failure. The reproducer stores that table as `case.json` and
+keeps the supplied Case as `discovered_case.json` when they differ.
 
 ## Document shape
 
@@ -123,8 +127,8 @@ parquity check case.json --out check-run
 
 ## Schema template for `fuzz --schema`
 
-Schema-aware fuzz accepts an ordinary Case with no rows. The Case identity is
-the schema identity; there is no second schema language.
+Schema-aware fuzz accepts an ordinary Case with no rows. The empty Case is the
+schema template; Parquity does not define a second schema document format.
 
 ```json
 {
@@ -151,10 +155,10 @@ the schema identity; there is no second schema language.
 
 ```console
 parquity fuzz --schema schema.json --examples 100 --seed 42 \
-  --max-findings 8 --out schema-run
+  --max-saved 8 --out schema-run
 ```
 
-The generated values preserve the supplied schema exactly. Findings still
+The generated values preserve the supplied schema exactly. Saved reproducers
 contain a canonical `case.json`, so they can be passed directly to `check`.
 
 ## Type and value reference
@@ -208,7 +212,10 @@ declared-width bits, treats all NaNs as equal, and distinguishes `-0.0` from
 
 ### Binary and decimal values
 
-Binary values use one base64 tag, for example `{"$binary":"AAE="}`.
+Binary values use canonical RFC 4648 Base64 with the standard alphabet and
+required padding, for example `{"$binary":"AAE="}`. Whitespace, URL-safe
+alphabet characters, missing padding, and other non-canonical encodings are
+rejected. The empty byte string is `{"$binary":""}`.
 
 `decimal128` precision is 1 through 38; scale is 0 through precision. Values
 use a canonical fixed-scale decimal string inside `{"$decimal":"..."}`.
@@ -219,7 +226,7 @@ values are not converted through binary floats.
 ### Lists, structs, and maps
 
 `list` values have variable length. `fixed_list` values must have exactly
-`size` items; `size` is a positive signed 32-bit integer.
+`size` items; `size` is an integer from 1 through 2³¹−1.
 
 A struct type contains an ordered `fields` array. A struct value uses those
 field names as exact object keys.
@@ -245,6 +252,11 @@ Schema-aware fuzz accepts fixed-list widths beyond four when the complete
 declared schema remains within the depth, node, and expanded-slot budgets.
 Fixed lists consume their declared width in that budget.
 
+`check` does not apply these generation bounds. It accepts any Case that passes
+the grammar and value validation described above. There is no separate
+Parquity row, column, or byte limit for `check`; practical size is bounded by
+available memory and by the selected providers, which run in the main process.
+
 ## Rejection and current scope
 
 Parsing rejects duplicate JSON keys, unknown keys or type parameters,
@@ -269,4 +281,4 @@ Canonical bytes define the Case SHA-256 identity.
 
 Package release policy is documented in [Versioning](../VERSIONING.md). See
 [Using Parquity](usage.md) for command behavior and [Evidence and replay](evidence.md)
-for saved bundle formats.
+for saved evidence.

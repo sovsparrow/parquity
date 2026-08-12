@@ -52,14 +52,28 @@ format identity such as `parquity.case.v1` identifies the grammar of a saved
 document. They are intentionally independent.
 
 An existing format identity never changes meaning. An incompatible change to a
-grammar, canonicalization rule, inventory, identity rule, occurrence
-extraction, or family projection requires a new format identity. A package may
-support more than one format generation while users migrate.
+grammar, canonicalization rule, inventory, identity rule, or evidence
+extraction requires a new format identity. A package may support more than one
+format generation while users migrate.
 
-The Case contract belongs to [Writing Cases](docs/cases.md). Bundle layouts,
-hashes, replay states, and derived triage identities belong to
-[Evidence and replay](docs/evidence.md). This file does not duplicate those
-format references.
+A producer may choose a different valid representative without changing the
+format identity, provided existing decoders still accept the document and the
+stored grammar, field meanings, canonicalization, identity calculation, and
+inventory remain unchanged. Renaming a required JSON field, changing which
+bytes an ID hashes, or giving persisted or projected evidence a different
+meaning requires a new format identity.
+
+New check and fuzz aggregates use `parquity.run.v2`; the released v1 decoder
+remains available. New scan aggregates and findings use `parquity.scan-run.v2`
+and `parquity.scan-finding.v2`; the released scan v1 decoders remain available.
+Package releases do not rewrite old evidence or couple artifact generations to
+the package's major, minor, or patch number.
+
+The Case contract belongs to [Writing Cases](docs/cases.md). Saved-evidence use
+and replay states belong to [Evidence and replay](docs/evidence.md). Machine
+identities, fields, and executable decoder owners belong to
+[Machine format overview](docs/machine-formats.md). This file does not duplicate
+those references.
 
 ## Provider behavior and reproducibility
 

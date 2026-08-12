@@ -54,8 +54,8 @@ or statistics.
 
 ## Capability evidence
 
-Each profiled run records a complete selected-writer by requested-profile
-capability grid. A supported record contains exact effective options. An
+Each profiled run records whether every requested profile is supported by each
+selected writer. A supported record contains exact effective options. An
 unsupported record contains `OPTION_UNAVAILABLE` and no options:
 
 ```json
@@ -80,8 +80,7 @@ unsupported record contains `OPTION_UNAVAILABLE` and no options:
 
 The enclosing key is `writer_profiles`. Every requested profile must be
 supported by at least one selected writer. An unsupported writer/profile
-endpoint creates no Parquet file, matrix cell, finding, or overflow
-observation.
+pair performs no write and creates no reader checks.
 
 ## Matrix cost
 
@@ -100,17 +99,12 @@ larger matrix is worth the extra provider work.
 
 ## Identity and replay
 
-A profiled execution is identified by writer name and version, profile name,
-and exact effective options. That identity is carried through matrix cells,
-fingerprints, finding and run identities, replay signatures, reports,
-reproduction scripts, CLI JSON, and generated triage.
+Parquity records the selected profile, writer version, and exact effective
+options with the result. Default and profiled writes are kept separate. When
+`--writer-profiles` is omitted, provider calls receive no added keyword
+arguments and profile fields are absent.
 
-Default executions in a profiled run omit `writer_profile` but remain bound to
-the complete enclosing capability plan. When `--writer-profiles` is omitted,
-profile fields are absent and provider calls receive no added keyword
-arguments. Default filenames and artifact shapes remain unchanged.
-
-Replay validates the recorded plan before provider work. If the exact profiled
+Replay requires the same writer profile and effective options. If that exact
 execution is no longer available, replay exits 2 with
 `WRITER_PROFILE_NOT_EVALUABLE`; it does not substitute a default write or
 return a partial aggregate result.
@@ -118,5 +112,5 @@ return a partial aggregate result.
 Installed provider behavior can change. `parquity engines` reports the live
 provider versions; each run records the versions it used. See
 [Providers](providers.md) for installation and selection, [Evidence](evidence.md)
-for bundle interpretation, and [Using Parquity](usage.md#add-writer-profiles)
+for saved-evidence interpretation, and [Using Parquity](usage.md#add-writer-profiles)
 for the command in context.

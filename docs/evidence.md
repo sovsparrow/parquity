@@ -1,69 +1,45 @@
 # Evidence and replay
 
-When `check`, `fuzz`, or `scan` publishes an output directory, open its
-`REPORT.md` first. The report points to retained findings and summarizes the
-selected providers, inputs, results, and any bounded overflow.
+Start with `REPORT.md`. It summarizes the observed failures and links to saved
+reproducers. Use `run.json`, `scan.json`, or `finding.json` for automation,
+validation, exact identities, and complete machine evidence.
 
-The JSON manifests are the authoritative record. Parquity preserves provider
-versions, directions, options, outcomes, hashes, and reproduction material so
-a result does not depend on terminal text.
+Parquity records observed behavior. It does not determine specification
+conformance, root cause, or provider fault.
 
-Evidence remains neutral. A majority of readers is not an oracle, and one
-finding is not by itself an upstream defect.
-
-## What a finding looks like
-
-A Parquity 0.1.0 fuzz run recorded this finding:
-
-```text
-Parquity observed READ_ERROR for duckdb -> pyarrow during read.
-Writer: duckdb 1.5.5
-Reader: pyarrow 25.0.0
-Diagnostic kind: ArrowInvalid
-Normalized detail: Length spanned by list offsets (1) larger than values
-  array (length 0)
-input.parquet: present
-```
-
-The excerpt records one environment. It is not a claim that other provider
-versions must produce the same result.
-
-## Generated and scan evidence
+## Two kinds of evidence
 
 Generated evidence starts from a `parquity.case.v1` Case. The Case declares the
-expected schema and values, so each writer-reader cell can be compared with the
-declared input.
+expected schema and values, so each writer-reader result can be compared with
+the supplied or generated table.
 
 Scan evidence starts from existing Parquet bytes. Each selected reader produces
 an independent observation. Parquity compares those observations with each
 other; it does not select a reference reader.
 
-The two sources have separate durable formats and identities. They can be
-viewed together through triage, but their manifests are not interchangeable.
+Scan comparison treats these representation-only Arrow aliases as equivalent:
 
-## Report vocabulary
+- `string`, `large_string`, and `string_view`;
+- `binary`, `large_binary`, and `binary_view`; and
+- `list` and `large_list`.
 
-- A **published run** is an output directory created only after its complete
-  bundle is ready. Agreement or no finding creates no run directory.
-- An **accepted scan input** is a file that passed the documented discovery,
-  file-size, and total-byte limits.
-- A **normalized location** is a structural value path used for grouping, such
-  as `$.rows[*].columns[0]`; data-dependent row numbers do not split one
-  structural symptom into several families.
-- **Comparison endpoints** are the exact reader groups on the two sides of a
-  semantic difference. Family identity records them so a different reader
-  partition cannot merge silently.
+Container child labels are ignored for variable and fixed lists, as are the
+conventional key and value labels in maps. Fixed-list width, map-versus-list
+structure, child types and nullability, `keys_sorted`, ordinary field names,
+metadata, and other semantic parameters remain significant. The original
+reader schemas remain in the machine evidence even when their comparison views
+agree.
 
 ## Generated run layout
 
-`check` and `fuzz` publish a `parquity.run.v1` aggregate:
+`check` and `fuzz` use the same output layout:
 
 ```text
 run-directory/
 ├── run.json
 ├── REPORT.md
 └── findings/
-    └── <finding-id>/
+    └── <id>/
         ├── finding.json
         ├── REPORT.md
         ├── case.json
@@ -71,28 +47,37 @@ run-directory/
         ├── reproduce.py
         ├── upstream_repro.py
         ├── discovered_case.json  # when reduction changed the Case
-        └── input.parquet         # when the target writer produced bytes
+        └── input.parquet         # when the writer produced bytes
 ```
 
-Each child is a standalone `parquity.finding.v1` bundle. Copying the child out
-of its aggregate does not remove information required for validation or
-replay. The aggregate indexes every child and records discovery bounds,
-retained findings, and bounded overflow.
+The `findings/` and `finding.json` names are retained machine-format names. In
+human reports, each row is a **failure** and each saved child is a
+**reproducer**.
 
-`matrix.json` contains the complete final selected matrix for that reduced
-Case, not only the target cell. `upstream_repro.py` collects direct provider
-evidence for the selected path; it is not a second semantic oracle.
+Parquity deduplicates equivalent failures and saves one minimized reproducer
+for each retained failure, up to `--max-saved`. Additional distinct failures
+remain in `run.json` without receiving a child directory. They are visible in
+the aggregate report as `not saved` and are not replay targets.
+
+`matrix.json` contains the complete selected matrix for the reduced Case, not
+only the failing path. `upstream_repro.py` exercises the selected provider path
+directly; it is supporting provider evidence, not a second semantic oracle.
+
+For `check` as well as `fuzz`, reduction may make the failing table smaller.
+`case.json` is the reduced reproducer. When it differs from the table that
+exposed the failure, `discovered_case.json` preserves that original Case.
 
 ## Scan run layout
 
-`scan` publishes a `parquity.scan-run.v1` aggregate:
+`scan` writes this layout when at least one reader failure or semantic
+difference is recorded:
 
 ```text
 scan-run/
 ├── scan.json
 ├── REPORT.md
 └── findings/
-    └── <finding-id>/
+    └── <id>/
         ├── finding.json
         ├── input.parquet
         ├── REPORT.md
@@ -100,137 +85,123 @@ scan-run/
         └── upstream_repro.py
 ```
 
-Each `parquity.scan-finding.v1` child is standalone. It binds the exact accepted
-input bytes, normalized relative source path, reader order and versions,
-timeout, every reader outcome, every comparison, and its reports and scripts.
+Each child contains the exact accepted source bytes and all recorded reader
+outcomes for that file. The parent records bounded discovery, selected readers,
+limits, files left unevaluated after an early stop, and links to each source
+reproducer.
 
-The parent records bounded discovery, limits, skipped symlinks, stop reason,
-overflow, report identity, and every child reference. One source file may
-produce several findings when it contains distinct observed symptoms.
+Agreement creates no output directory. With zero or one successful reader,
+cross-reader semantic comparison is unavailable; reader failures are not
+reported as agreement.
 
-## Identities and hashes
+## Integrity and authority
 
-Canonical JSON and SHA-256 digests make artifact changes detectable:
+Every saved artifact is covered by canonical JSON and SHA-256 digests.
+Validation rejects missing, extra, malformed, non-canonical, or
+digest-mismatched files before replay starts provider execution. `REPORT.md`
+is also bound by path, byte count, and digest.
 
-- a Case identity hashes its canonical `case.json` bytes;
-- a finding identity binds its target and all required child artifacts;
-- a run identity binds discovery evidence and its complete child index;
-- scan identities additionally bind the accepted source bytes and reader
-  observation evidence.
-
-Validation rejects missing, extra, malformed, non-canonical, or digest-mismatched
-artifacts before replay starts providers.
-
-These hashes establish internal byte consistency only. They are not digital
+The JSON manifest is authoritative when a report and machine evidence differ.
+The hashes establish internal byte consistency only. They are not digital
 signatures, do not identify an author, do not prove provenance, and do not make
 retained data anonymous.
 
-## Durable format identities
+See [Machine format overview](machine-formats.md) for format identities, exact
+top-level fields, grouping keys, compatibility projections, and canonical
+ordering.
 
-Saved formats are versioned independently of the Parquity package. Generated
-Cases, findings, and runs use `parquity.case.v1`, `parquity.finding.v1`, and
-`parquity.run.v1`. Scan findings and aggregates use
-`parquity.scan-finding.v1` and `parquity.scan-run.v1`.
+## Replay saved evidence
 
-Machine-readable command results use `parquity.cli.v1`. Compatible updates may
-add fields; consumers must ignore fields they do not recognize.
+Replay accepts a standalone reproducer or a generated or scan run directory:
 
-These identities have exact manifest shapes and inventories. A decoder does
-not guess a newer branch. An incompatible change to grammar, inventory,
-identity, extraction, or projection requires a new format identity. Derived
-triage occurrences and families carry their own format identities because
-their grouping rules can evolve without rewriting stored bundles.
+```console
+parquity replay run-directory
+```
 
-Generated and scan manifests are not interchangeable. A standalone finding
-cannot be decoded as an aggregate, and a scan finding cannot be decoded as a
-generated finding.
+Replay validates the saved inventory, resolves the recorded providers and
+writer options, and performs a fresh evaluation. It never rewrites the captured
+report or manifests. A run replay evaluates saved reproducers only; failures
+recorded only in `run.json` are not replay targets.
 
-## Finding, occurrence, family, and defect
-
-The terms describe different layers:
-
-| Layer | Meaning |
-|---|---|
-| Matrix cell or reader observation | One engine operation and its result. |
-| Finding bundle | One retained non-passing target plus enough context to inspect and replay it. |
-| Symptom occurrence | One derived signal inside one validated finding. |
-| Symptom family | A deterministic grouping of occurrences with the same signal and canonical evidence shape. |
-| Root cause | The implementation condition that produces one or more symptoms; Parquity does not infer it. |
-| Upstream defect | A root cause accepted as a defect in an upstream project; a maintainer or investigation establishes it. |
-
-A generated finding has one occurrence. A scan finding has one occurrence for
-each failed reader and one for each distinct semantic signal at a normalized
-location. Comparisons at the same location remain attached to that occurrence.
-
-Family identity has one signal. Scan families also bind the complete reader
-roster and comparison endpoints, so results from different reader matrices do
-not merge silently. Row ordinals and package versions remain visible evidence
-but do not become family identity.
-
-Triage may therefore report more occurrences than finding bundles, and more or
-fewer families than source files. None of those counts is a count of upstream
-defects.
-
-Aggregate `REPORT.md` files include these families automatically. The optional
-`parquity triage` command exposes the grouping, applies focus filters, and can
-attach states from a complete replay document; it does not perform a second
-discovery campaign. Pass `--json` for the canonical structured view.
-
-## Replay classifications
-
-Replay validates a bundle, resolves its recorded provider set, and performs a
-fresh evaluation. It reports package and provider version drift separately
-from reproduction state.
+Replay reports package and provider version drift separately from the result:
 
 | State | Meaning |
 |---|---|
-| `REPRODUCED` | The recorded target or occurrence was observed exactly. |
-| `RELATED_FAILURE` | The same evidence shape remained but normalized detail changed, or a mixed/new scan symptom prevents an exact aggregate classification. |
-| `NOT_REPRODUCED` | The recorded target or occurrence was absent in this evaluation. |
-| `NOT_CHECKED` | Triage has no bound replay evidence for the family. |
+| `REPRODUCED` | The exact recorded failure was observed again. |
+| `RELATED_FAILURE` | The saved input still failed, but not with the exact recorded identity. For example, the exception kind may match while its normalized detail differs, or scan replay may contain a mixture of reproduced, missing, and new reader observations. |
+| `NOT_REPRODUCED` | The recorded failure was absent in this evaluation. |
 
-Scan replay also reports `new_observations` that were not in the original
-occurrence inventory. A related or absent state does not mean an upstream fix
-was confirmed; provider versions, environment, or behavior may have changed.
+Scan replay also reports `new_observations` that were absent from the original
+capture. A related or absent result does not prove that an upstream issue was
+fixed; provider versions, environment, or behavior may have changed.
 
-Replay exits 1 when at least one recorded target reproduces exactly. It exits 0
-when none reproduces exactly, including a related-only result. Missing required
-providers, invalid evidence, or an exact writer profile that can no longer be
-evaluated exit 2.
+Replay exit meanings are:
+
+| Exit | Meaning |
+|---:|---|
+| 0 | No saved target reproduced exactly. |
+| 1 | At least one saved target reproduced exactly. |
+| 2 | Required evidence, provider, or writer profile was unavailable or invalid. |
+| 3 | Parquity failed before producing a valid replay result. |
+
+Exit 1 is a replay result, not a command failure.
 
 ## Reports and scripts
 
-`REPORT.md` is a human-readable projection of bound evidence. The canonical
-JSON manifests remain authoritative. Reports escape untrusted text. Long
-diagnostics are truncated in the report; their complete text remains bound by
-the digest in the manifest.
+Aggregate reports use the same four-column model:
 
-`reproduce.py` invokes authoritative Parquity replay. `upstream_repro.py`
-invokes the selected provider path and emits direct evidence. Bundle validation
-does not execute either script and does not certify a script from an untrusted
-bundle as safe. Inspect scripts before running them.
+```text
+Writer -> reader or Reader(s) | Failure | Table/File and location | Reproduce
+```
 
-## Before sharing a bundle
+Generated reports show the reduced table shape and exact structural location.
+Scan reports show the source file and either a structural location or the whole
+file for reader failures. Aggregate tables shorten long diagnostics; open the
+linked reproducer for the complete text and evidence.
 
-Generated findings may retain the canonical and discovered Case, complete
-matrix results, a writer-produced `input.parquet`, provider versions,
-diagnostics, platform data, and executable scripts. Scan findings retain the
-exact accepted source bytes as `input.parquet`, plus normalized source paths,
-schemas, observations, diagnostics, versions, and scripts.
+`reproduce.py` invokes authoritative Parquity replay and forwards the exit
+meanings above. `upstream_repro.py` invokes provider calls directly and emits
+JSON evidence. Generated scripts run the selected writer-reader path; scan
+scripts require one recorded reader name as an argument. A provider error exits
+1, while a successful direct provider call exits 0 even when its printed schema
+or values expose a semantic difference.
+
+Validation does not execute either script and does not certify a script from an
+untrusted directory as safe. Inspect scripts before running them.
+
+## From failure to upstream report
+
+1. Open `REPORT.md`.
+2. Open the reproducer for the relevant failure.
+3. Run `python reproduce.py`.
+4. Inspect the complete matrix or reader outcomes.
+5. Run `python upstream_repro.py` for direct provider behavior.
+6. Check the recorded Parquity, Python, platform, provider, and dependency
+   versions.
+7. Review every retained file before sharing it or filing an upstream issue.
+
+## Before sharing evidence
+
+Generated reproducers may retain the reduced and original Case, matrix results,
+a writer-produced `input.parquet`, provider versions, diagnostics, platform
+data, and executable scripts. Scan reproducers retain the exact accepted source
+bytes, normalized source path, schemas, observations, diagnostics, versions,
+and scripts.
 
 Removing an absolute path does not anonymize this material. Field names,
-values, relative filenames, schemas, and provider messages may reveal
-personal, commercial, or environment information.
+values, relative filenames, schemas, and provider messages may reveal personal,
+commercial, or environment information.
 
 Before sharing:
 
-1. Inspect every retained Parquet, JSON, Markdown, and Python file.
-2. Treat source values, schema, filenames, versions, and diagnostics as
-   potentially sensitive.
+1. Inspect every retained Parquet, JSON, report, and Python file.
+2. Treat values, schemas, filenames, versions, and diagnostics as potentially
+   sensitive.
 3. Do not redact a bound file in place; changing it invalidates the manifest.
-4. Prefer reproducing a non-sensitive minimal Case and sharing that new bundle
-   instead of production bytes.
+4. Prefer reproducing a non-sensitive minimal Case and sharing that new
+   reproducer instead of production bytes.
 5. Use a channel appropriate for the data and recipient.
 
 See [Using Parquity](usage.md) for commands, [Writing Cases](cases.md) for the
-Case format, and [Versioning](../VERSIONING.md) for package compatibility.
+Case grammar, [Machine format overview](machine-formats.md) for machine
+contracts, and [Versioning](../VERSIONING.md) for compatibility policy.

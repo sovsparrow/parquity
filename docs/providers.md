@@ -26,7 +26,7 @@ python -m pip install 'parquity[datafusion,fastparquet]'
 ```
 
 The declared minimum versions are DataFusion 54.0.0 and fastparquet 2026.5.0.
-All five provider directions are declared for Python 3.11 through 3.14.
+Parquity supports all five providers on Python 3.11 through 3.14.
 `parquity engines` reports what is installed in the current environment and
 records each discovered version.
 
@@ -37,10 +37,8 @@ fastparquet is included as a legacy-interoperability provider and brings NumPy,
 pandas, and its compression dependencies. Neither is required to use the core
 writer-by-reader matrix.
 
-Optional means separately installed and explicitly selected. It does not mean
-that evidence from the provider is treated as less important. Keeping the
-extras independent also avoids turning a changing provider set into a stable
-`all` extra whose membership users might rely on.
+Optional means separately installed and explicitly selected. Evidence from an
+optional provider is handled the same way as evidence from a core provider.
 
 ## Default and explicit selection
 
@@ -71,7 +69,8 @@ direction is a configuration error and exits 2 before a partial matrix is
 reported.
 
 Replay does not use the current default. It resolves the exact writer and
-reader sets recorded in the bundle and refuses to evaluate a smaller matrix.
+reader sets recorded with the evidence and refuses to evaluate a smaller
+matrix.
 See [Evidence](evidence.md) for replay states and exits.
 
 ## Writer options
@@ -84,8 +83,9 @@ it is separate from the reader/writer direction table above.
 
 Parquity records provider name and version with every result. Dependency lower
 bounds in package metadata are installation constraints, not a claim that all
-future combinations behave identically. Preserve the bundle when a result
-matters; replay reports version drift separately from reproduction state.
+future combinations behave identically. Preserve the saved evidence when a
+result matters; replay reports version drift separately from reproduction
+state.
 
 Provider code executes with the current user's authority. `scan` contains each
 reader-file operation in a child process, but that boundary is not a sandbox.

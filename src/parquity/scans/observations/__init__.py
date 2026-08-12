@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import struct
 from dataclasses import dataclass
@@ -9,7 +8,10 @@ from typing import NamedTuple, Protocol, cast
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-from .records import MAX_OBSERVATION_BYTES, valid_digest
+from ...evidence import digest_matches, is_sha256, sha256_hex
+from ..differences import DifferenceKind, ScanDifference
+from ..limits import MAX_OBSERVATION_BYTES
+from .schema import SchemaView, scalar_aliases_equivalent, schema_difference
 
 _DETAIL_LIMIT = 500
 
@@ -30,7 +32,7 @@ class ObservationMetadata:
         digests = (self.sha256, self.schema_sha256)
         if any(value < 0 for value in counts) or self.byte_count > MAX_OBSERVATION_BYTES:
             raise ObservationError("observation metadata counts are invalid")
-        if any(not valid_digest(value) for value in digests):
+        if any(not is_sha256(value) for value in digests):
             raise ObservationError("observation metadata digests are invalid")
 
 
@@ -42,20 +44,19 @@ class ObservationGroup(NamedTuple):
 class ObservationDifference(NamedTuple):
     left_group: str
     right_group: str
-    kind: str
+    kind: DifferenceKind
     path: str
     detail: str
 
     def to_data(self) -> dict[str, object]:
-        return cast(dict[str, object], self._asdict())
-
-
-class _SchemaView(Protocol):
-    def field(self, index: int) -> pa.Field[pa.DataType]: ...
-
-
-class _FieldView(Protocol):
-    def equals(self, other: object, check_metadata: bool = False) -> bool: ...
+        difference = ScanDifference.from_persisted(self.kind, self.path)
+        return {
+            "left_group": self.left_group,
+            "right_group": self.right_group,
+            "kind": difference.kind.value,
+            "path": difference.path,
+            "detail": self.detail,
+        }
 
 
 class _ValuesView(Protocol):
@@ -113,12 +114,8 @@ def decode_observation(
     payload: bytes,
     expected: ObservationMetadata,
 ) -> Observation:
-    if len(payload) > MAX_OBSERVATION_BYTES or (
-        len(payload),
-        hashlib.sha256(payload).hexdigest(),
-    ) != (
-        expected.byte_count,
-        expected.sha256,
+    if len(payload) > MAX_OBSERVATION_BYTES or not digest_matches(
+        payload, expected.sha256, expected.byte_count
     ):
         raise ObservationError("observation artifact digest does not match")
     try:
@@ -171,13 +168,23 @@ def _compare_tables(
     left_group: str,
     right_group: str,
 ) -> ObservationDifference | None:
-    if not left.schema.equals(right.schema, check_metadata=True):
-        path, detail = _schema_difference(left.schema, right.schema)
-        return ObservationDifference(left_group, right_group, "SCHEMA_DIFFERENCE", path, detail)
+    if (schema_mismatch := schema_difference(left.schema, right.schema)) is not None:
+        path, detail = schema_mismatch
+        return ObservationDifference(
+            left_group,
+            right_group,
+            DifferenceKind.SCHEMA_DIFFERENCE,
+            path,
+            detail[:_DETAIL_LIMIT],
+        )
     if left.num_rows != right.num_rows:
         detail = f"row count {left.num_rows} != {right.num_rows}"
         return ObservationDifference(
-            left_group, right_group, "ROW_COUNT_DIFFERENCE", "$.rows", detail
+            left_group,
+            right_group,
+            DifferenceKind.ROW_COUNT_DIFFERENCE,
+            "$.rows",
+            detail,
         )
     for column_index in range(left.num_columns):
         left_column = left.column(column_index)
@@ -188,14 +195,14 @@ def _compare_tables(
             mismatch = _value_mismatch(left_value, right_value, "$")
             if mismatch is None:
                 continue
-            schema = cast(_SchemaView, cast(object, left.schema))
+            schema = cast(SchemaView, cast(object, left.schema))
             name = schema.field(column_index).name
             location = "" if mismatch.location == "$" else f" at {mismatch.location}"
             detail = f"column {name!r}{location}: {mismatch.detail}"[:_DETAIL_LIMIT]
             return ObservationDifference(
                 left_group,
                 right_group,
-                "VALUE_DIFFERENCE",
+                DifferenceKind.VALUE_DIFFERENCE,
                 f"$.rows[{row_index}].columns[{column_index}]",
                 detail,
             )
@@ -238,6 +245,14 @@ def _value_mismatch(
         left_value = cast(_DictionaryView, cast(object, left)).value
         right_value = cast(_DictionaryView, cast(object, right)).value
         return _value_mismatch(left_value, right_value, f"{location}.dictionary")
+    return _scalar_mismatch(left, right, location)
+
+
+def _scalar_mismatch(
+    left: pa.Scalar[pa.DataType], right: pa.Scalar[pa.DataType], location: str
+) -> _ValueMismatch | None:
+    if (aliases_equal := scalar_aliases_equivalent(left, right)) is not None:
+        return None if aliases_equal else _leaf_mismatch(left, right, location)
     if not cast(_ScalarView, cast(object, left)).equals(right):
         return _leaf_mismatch(left, right, location)
     return None
@@ -320,28 +335,12 @@ def _scalar_repr(value: pa.Scalar[pa.DataType]) -> str:
         return repr(value)
 
 
-def _schema_difference(left: pa.Schema, right: pa.Schema) -> tuple[str, str]:
-    if len(left) != len(right):
-        return "$.schema", f"field count {len(left)} != {len(right)}"
-    left_view = cast(_SchemaView, cast(object, left))
-    right_view = cast(_SchemaView, cast(object, right))
-    for index in range(len(left)):
-        left_field = left_view.field(index)
-        right_field = right_view.field(index)
-        if not cast(_FieldView, cast(object, left_field)).equals(right_field, check_metadata=True):
-            return (
-                f"$.schema.fields[{index}]",
-                f"{left_field!s} != {right_field!s}"[:_DETAIL_LIMIT],
-            )
-    return "$.schema", "schema metadata differs"
-
-
 def _metadata(table: pa.Table, payload: bytes, schema: pa.Schema) -> ObservationMetadata:
     schema_payload = schema.serialize().to_pybytes()
     return ObservationMetadata(
         len(payload),
-        hashlib.sha256(payload).hexdigest(),
+        sha256_hex(payload),
         table.num_rows,
         table.num_columns,
-        hashlib.sha256(schema_payload).hexdigest(),
+        sha256_hex(schema_payload),
     )

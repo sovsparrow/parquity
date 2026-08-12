@@ -1,349 +1,361 @@
 from __future__ import annotations
 
-from typing import cast
+from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass
 
-from ..findings.bundle import ValidatedBundle
-from ..findings.evidence import DISCOVERY_OVERFLOW
+from ..case import type_label
+from ..evidence import EngineVersion, ReplayClassification
+from ..generation.evidence import (
+    CHECK_COMPLETE,
+    EXAMPLE_BOUND_REACHED,
+    SAVED_EVIDENCE_LIMIT_REACHED,
+    STRATEGY_EXHAUSTED,
+    DiscoveryEvidence,
+)
+from ..generation.search.identity import FindingKey, finding_key
 from ..model import Case
 from ..reporting import (
-    human_location,
-    markdown_literal,
-    profile_label,
-    render_case_rows,
-    render_case_schema,
+    MAX_LOCATION_CHARS,
+    MAX_SUMMARY_CHARS,
+    ArtifactRef,
+    DetailView,
+    EvidenceKind,
+    FindingView,
+    ReplayState,
+    ReplayStateCount,
+    ReportValidationError,
+    RunReportView,
+    bounded_text,
+    environment_details,
 )
-from ..triage.adapters import generated_child_occurrences
-from ..triage.model import Family, group_occurrences
-from ..verdicts import EngineVersion
-from .model import RunRecord
+from ..verdicts import CellResult, FailureFingerprint
+from .bundle import ValidatedRun
+from .formats import v2
+from .source import RunV2Source
 
 
-def render_run_report(run: RunRecord, children: tuple[ValidatedBundle, ...]) -> bytes:
-    child_by_finding = {child.finding.finding_id: child for child in children}
-    generation = children[0].finding.generation if children else None
-    case_labels, grouped_cases = _case_index(run, child_by_finding)
-    families = group_occurrences(generated_child_occurrences(children))
-    lines = [
-        f"# Parquity {run.command} run",
-        "",
-        *_opening(run),
-        "",
-        "## Run scope",
-        "",
-        *_scope_table(run, children),
-        "",
-        "A finding is one reproducible symptom, not a count of upstream defects.",
-        "One generated Case can produce several findings or other observations.",
-        "",
-        "## Inputs with observed problems",
-        "",
-    ]
-    for label, case, finding_ids in grouped_cases:
-        lines.extend(_case_section(label, case, finding_ids, child_by_finding))
-    if run.overflow:
-        lines.extend(("", *_overflow_section(run, case_labels)))
-    lines.extend(
-        (
-            "",
-            *_family_section(families),
-            "",
-            "## Replay and triage",
-            "",
-            "- `parquity replay .` validates the run and re-executes every exact target.",
-            "- `parquity replay --json . > replay.json` writes canonical replay evidence.",
-            "- `parquity triage .` groups repeated symptom shapes without treating families as",
-            "  confirmed upstream bugs.",
-            "",
-            "Replay exits 1 when at least one exact target reproduces. Exit 0 means no exact",
-            "target reproduced; related or unevaluable outcomes remain separately classified.",
-            "",
-            "## Coverage and limits",
-            "",
-            *_coverage_lines(run),
-            "",
-            "## Environment and exact evidence",
-            "",
-            f"- Command: `{_command(run, schema=generation is not None)}`",
-            f"- Run identity: `{run.run_id}`",
-            f"- Writers: `{_engines(run.writers)}`",
-            f"- Readers: `{_engines(run.readers)}`",
-            f"- Parquity: `{run.environment.parquity_version}`",
-            f"- Hypothesis: `{run.environment.hypothesis_version}`",
-            f"- Python: `{run.environment.python_version}`",
-            f"- Platform: `{run.environment.platform}`",
-            *(
-                ()
-                if generation is None
-                else (
-                    f"- Generation profile: `{generation.profile}`",
-                    f"- Schema Case identity: `{generation.schema_case_id}`",
-                )
-            ),
-            "- Canonical run manifest: [`run.json`](run.json)",
-            "",
+@dataclass(frozen=True, slots=True)
+class _SavedRepresentative:
+    finding_id: str
+    case: Case
+    fingerprint: FailureFingerprint
+    result: CellResult
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestRepresentative:
+    case: Case
+    fingerprint: FailureFingerprint
+    result: CellResult
+
+
+def build_run_report_view(
+    validated: ValidatedRun,
+    replay: Mapping[str, ReplayClassification] | None = None,
+    *,
+    command_line: str | None = None,
+) -> RunReportView:
+    run = validated.run
+    if not isinstance(run, v2.RunRecord):
+        raise ReportValidationError("generated reporting requires a validated run.v2 bundle")
+    occurrences = _occurrences_by_key(run)
+    saved = _saved_by_key(validated)
+    manifest_only = _manifest_only_by_key(run)
+    saved_ids = {item.finding_id for item in saved.values()}
+    if replay is not None and set(replay) != saved_ids:
+        raise ReportValidationError("generated replay overlay does not match all saved targets")
+    keys = tuple(sorted(occurrences))
+    if set(keys) != set(saved) | set(manifest_only):
+        raise ReportValidationError("generated report representatives do not partition evidence")
+    findings = tuple(
+        _finding_view(
+            index,
+            key,
+            occurrences[key],
+            saved.get(key),
+            manifest_only.get(key),
+            replay,
         )
+        for index, key in enumerate(keys, start=1)
     )
-    return "\n".join(lines).encode()
-
-
-def _opening(run: RunRecord) -> tuple[str, ...]:
-    retained = len(run.findings)
-    finding_word = "finding" if retained == 1 else "findings"
-    overflow_word = "observation" if len(run.overflow) == 1 else "observations"
-    if run.overflow:
-        return (
-            f"Parquity saved **{retained}** reproducible {finding_word} with individual reports.",
-            f"It also recorded **{len(run.overflow)}** other distinct {overflow_word} in "
-            "`run.json` after reaching the `--max-findings` limit.",
-            "This run is intentionally bounded and is not exhaustive.",
-        )
-    return (f"Parquity saved **{retained}** reproducible {finding_word}.",)
-
-
-def _scope_table(run: RunRecord, children: tuple[ValidatedBundle, ...]) -> tuple[str, ...]:
-    discovery = run.discovery
-    requested = "1" if run.command == "check" else str(discovery.examples)
-    evaluated = "1" if run.command == "check" else _count(discovery.evaluated_cases)
-    cells = _count(discovery.evaluated_cells)
-    if run.command == "check":
-        cells = str(len(children[0].matrix.results))
-    return (
-        "| Measure | Value |",
-        "|---|---:|",
-        f"| {'Supplied Case' if run.command == 'check' else '`--examples` requested'} | "
-        f"{requested} |",
-        f"| Cases actually checked | {evaluated} |",
-        f"| Writer-reader cells actually checked | {cells} |",
-        f"| Findings with individual reports | {len(run.findings)} |",
-        f"| Other observations without individual reports | {len(run.overflow)} |",
-        f"| Why the run stopped | {_stop_reason(discovery.stop_reason)} |",
+    affected_inputs = {item.case_id for values in occurrences.values() for item in values}
+    return RunReportView(
+        command=run.command,
+        evidence_kind=EvidenceKind.GENERATED,
+        summary=_run_summary(
+            run.command,
+            run.evaluated_inputs,
+            run.executed_checks,
+            len(findings),
+            sum(len(items) for items in occurrences.values()),
+            len(saved),
+            run.discovery.stop_reason,
+        ),
+        writers=_provider_labels(run.writers),
+        readers=_provider_labels(run.readers),
+        evaluated_input_count=run.evaluated_inputs,
+        executed_check_count=run.executed_checks,
+        affected_input_count=len(affected_inputs),
+        findings=findings,
+        saved_evidence_count=len(saved),
+        evidence_bundle_count=len(validated.children),
+        unevaluated_input_count=0,
+        stop=_stop_label(run.discovery.stop_reason),
+        bounds=_bounds(run),
+        environment=_environment(run),
+        machine_record=ArtifactRef("run.json", "run.json"),
+        command_line=command_line,
     )
 
 
-def _case_index(
-    run: RunRecord,
-    children: dict[str, ValidatedBundle],
-) -> tuple[dict[str, str], tuple[tuple[str, Case, tuple[str, ...]], ...]]:
-    labels: dict[str, str] = {}
-    cases: dict[str, Case] = {}
-    findings: dict[str, list[str]] = {}
-    for item in run.findings:
-        case = children[item.finding_id].case
-        if case.case_id not in labels:
-            labels[case.case_id] = f"C{len(labels) + 1}"
-            cases[case.case_id] = case
-            findings[case.case_id] = []
-        findings[case.case_id].append(item.finding_id)
-    grouped = tuple(
-        (labels[case_id], cases[case_id], tuple(findings[case_id])) for case_id in labels
-    )
-    return labels, grouped
-
-
-def _case_section(
-    label: str,
-    case: Case,
-    finding_ids: tuple[str, ...],
-    children: dict[str, ValidatedBundle],
-) -> tuple[str, ...]:
-    first = finding_ids[0]
-    row_word = "row" if len(case.rows) == 1 else "rows"
-    column_word = "column" if len(case.fields) == 1 else "columns"
-    lines = [
-        f"### {label} · {len(case.rows)} {row_word} · {len(case.fields)} {column_word}",
-        "",
-        f"Case identity: `{case.case_id}` · [open canonical Case](findings/{first}/case.json)",
-        "",
-        "#### Schema",
-        "",
-        *render_case_schema(case),
-        "",
-        "#### Data",
-        "",
-        *render_case_rows(case),
-        "",
-        "#### Findings from this Case",
-        "",
-        "| # | Route | Result | Where | Detail | Evidence |",
-        "|---:|---|---|---|---|---|",
-    ]
-    profiled = children[first].finding.writer_profiles is not None
-    for index, finding_id in enumerate(finding_ids, start=1):
-        child = children[finding_id]
-        target = child.finding.result
-        writer = target.writer + profile_label(target.writer_profile, profiled=profiled)
-        reader = "write stage" if target.reader == "*" else target.reader
-        lines.append(
-            f"| {index} | `{writer}` → `{reader}` | `{target.verdict.value}` | "
-            f"{human_location(target.schema_path, case)} | {_brief(target.detail)} | "
-            f"[open finding](findings/{finding_id}/REPORT.md) |"
-        )
-    return (*lines, "")
-
-
-def _overflow_section(run: RunRecord, case_labels: dict[str, str]) -> tuple[str, ...]:
-    unknown: dict[str, str] = {}
-    unknown_cases: dict[str, Case] = {}
-    lines = [
-        "## Other observations without individual reports",
-        "",
-        "After reaching the requested finding limit, Parquity stopped creating individual",
-        "finding directories. The exact observations below remain recorded in `run.json`.",
-        "They are not extra generated Cases or confirmed upstream bugs.",
-        "",
-        "`Discovery` means an evaluated generated Case exposed the observation. `Minimization`",
-        "means simplifying a saved finding's Case exposed a sibling observation.",
-        "",
-        "| Input | Origin | Route | Result | Location | Detail |",
-        "|---|---|---|---|---|---|",
-    ]
-    profiled = run.writer_profiles is not None
-    for item in run.overflow:
-        fingerprint = item.fingerprint
-        writer = fingerprint.writer + profile_label(fingerprint.writer_profile, profiled=profiled)
-        label = case_labels.get(item.case_id)
-        if label is None:
-            label = unknown.setdefault(item.case_id, f"U{len(unknown) + 1}")
-            unknown_cases.setdefault(label, item.case)
-        origin = "Discovery" if item.origin == DISCOVERY_OVERFLOW else "Minimization"
-        reader = "write stage" if fingerprint.reader == "*" else fingerprint.reader
-        location = human_location(fingerprint.schema_path, item.case)
-        lines.append(
-            f"| {label} | {origin} | `{writer}` → `{reader}` | "
-            f"`{fingerprint.verdict.value}` | {location} | "
-            f"{_brief(item.result.detail)} |"
-        )
-    lines.extend(("", "Exact records are preserved in [`run.json`](run.json)."))
-    if unknown_cases:
-        lines.extend(
-            (
-                "",
-                "### Inputs represented only in `run.json`",
-                "",
-                "`U1`, `U2`, and so on identify Cases without individual finding directories.",
-            )
-        )
-    for label, case in unknown_cases.items():
-        row_word = "row" if len(case.rows) == 1 else "rows"
-        column_word = "column" if len(case.fields) == 1 else "columns"
-        lines.extend(
-            (
-                "",
-                f"#### {label} · {len(case.rows)} {row_word} · {len(case.fields)} {column_word}",
-                "",
-                *render_case_schema(case),
-                "",
-                *render_case_rows(case),
-            )
-        )
-    return tuple(lines)
-
-
-def _family_section(families: tuple[Family, ...]) -> tuple[str, ...]:
-    occurrences = sum(len(family.occurrences) for family in families)
-    occurrence_word = "occurrence" if occurrences == 1 else "occurrences"
-    family_word = "family" if len(families) == 1 else "families"
-    lines = [
-        "## Symptom families",
-        "",
-        f"Parquity grouped **{occurrences}** {occurrence_word} into **{len(families)}**",
-        f"conservative {family_word}. A family is a navigation aid, not a confirmed root cause",
-        "or bug count.",
-        "",
-        "| Signal | Source cell result | Route | Diagnostic kind | Detail | "
-        "Occurrences | Replay state | Evidence |",
-        "|---|---|---|---|---|---:|---|---|",
-    ]
-    for family in families:
-        representative = family.representative
-        diagnostics = cast(list[dict[str, str]], family.projection["diagnostics"])
-        lines.append(
-            f"| `{family.signal.value}` | `{_source_verdict(family)}` | "
-            f"`{_family_route(family)}` | {_brief(diagnostics[0]['diagnostic_kind'])} | "
-            f"{_brief(representative.detail)} | "
-            f"{len(family.occurrences)} | `{representative.reproduction_state.value}` | "
-            f"[open finding](findings/{representative.finding_id}/REPORT.md) |"
-        )
-    return tuple(lines)
-
-
-def _coverage_lines(run: RunRecord) -> tuple[str, ...]:
-    discovery = run.discovery
-    lines = [
-        f"- The run stopped because: {_stop_reason(discovery.stop_reason)}.",
-        "- Results cover only the selected providers, versions, profiles, seed, and bounds.",
-        "- A finding proves recorded behavior; it does not assign provider fault.",
-    ]
-    if discovery.examples is not None:
-        lines.extend(
-            (
-                f"- Requested example bound: `{discovery.examples}`; seed: `{discovery.seed}`.",
-                f"- Finding-report limit: `{discovery.max_findings}`.",
-            )
-        )
-    return tuple(lines)
-
-
-def _command(run: RunRecord, *, schema: bool) -> str:
-    suffix = _selection_suffix(run)
-    if run.command == "check":
-        return f"parquity check CASE.json --out RUN_DIR{suffix}"
-    discovery = run.discovery
-    profile = " --schema SCHEMA_CASE.json" if schema else ""
-    return (
-        f"parquity fuzz --examples {discovery.examples} --seed {discovery.seed} "
-        f"--max-findings {discovery.max_findings}{profile} --out RUN_DIR{suffix}"
+def build_clean_run_report_view(
+    source: RunV2Source,
+    *,
+    command_line: str | None = None,
+) -> RunReportView:
+    if source.findings or source.overflow or source.occurrences:
+        raise ReportValidationError("clean generated reporting requires empty evidence")
+    return RunReportView(
+        command=source.command,
+        evidence_kind=EvidenceKind.GENERATED,
+        summary=_run_summary(
+            source.command,
+            source.evaluated_inputs,
+            source.executed_checks,
+            0,
+            0,
+            0,
+            source.discovery.stop_reason,
+        ),
+        writers=_provider_labels(source.writers),
+        readers=_provider_labels(source.readers),
+        evaluated_input_count=source.evaluated_inputs,
+        executed_check_count=source.executed_checks,
+        affected_input_count=0,
+        findings=(),
+        saved_evidence_count=0,
+        evidence_bundle_count=0,
+        unevaluated_input_count=0,
+        stop=_stop_label(source.discovery.stop_reason),
+        bounds=_discovery_bounds(source.command, source.discovery),
+        environment=environment_details(source.environment),
+        machine_record=None,
+        command_line=command_line,
     )
 
 
-def _selection_suffix(run: RunRecord) -> str:
-    writers = ",".join(engine.name for engine in run.writers)
-    readers = ",".join(engine.name for engine in run.readers)
-    profiles = ""
-    if run.writer_profiles is not None:
-        profiles = f" --writer-profiles {','.join(run.writer_profiles.requested_profiles)}"
-    return f" --writers {writers} --readers {readers}{profiles}"
-
-
-def _count(value: int | None) -> str:
-    return "not recorded" if value is None else str(value)
-
-
-def _stop_reason(value: str) -> str:
-    if value == "FINDING_CAP_REACHED":
-        return "the `--max-findings` limit was reached"
-    if value == "EXAMPLE_BOUND_REACHED":
-        return "the requested generated-Case bound was reached"
-    return "the supplied Case was checked"
-
-
-def _source_verdict(family: Family) -> str:
-    provider = "WRITE_ERROR" if family.projection["operation"] == "write" else "READ_ERROR"
+def _occurrences_by_key(
+    run: v2.RunRecord,
+) -> dict[FindingKey, tuple[v2.OccurrenceRecord, ...]]:
+    grouped: defaultdict[FindingKey, list[v2.OccurrenceRecord]] = defaultdict(list)
+    for occurrence in run.occurrences:
+        grouped[occurrence.key].append(occurrence)
     return {
-        "PROVIDER_ERROR": provider,
-        "ROW_COUNT_DIFFERENCE": "ROW_COUNT_MISMATCH",
-        "VALUE_DIFFERENCE": "VALUE_MISMATCH",
-        "SCHEMA_DIFFERENCE": "SCHEMA_MISMATCH",
-    }[family.signal.value]
+        key: tuple(sorted(values, key=lambda item: item.occurrence_id))
+        for key, values in grouped.items()
+    }
 
 
-def _family_route(family: Family) -> str:
-    entries = cast(list[dict[str, str]], family.projection["engine_roles"])
-    roles = {item["role"]: item["engine"] for item in entries}
-    writer = roles.get("writer", "?") + profile_label(
-        family.representative.writer_profile,
-        profiled=family.representative.writer_profiles is not None,
+def _saved_by_key(validated: ValidatedRun) -> dict[FindingKey, _SavedRepresentative]:
+    result: dict[FindingKey, _SavedRepresentative] = {}
+    for index, child in zip(validated.run.findings, validated.children, strict=True):
+        key = finding_key(index.fingerprint)
+        if key in result:
+            raise ReportValidationError("generated saved Finding keys are not unique")
+        result[key] = _SavedRepresentative(
+            index.finding_id,
+            child.case,
+            index.fingerprint,
+            child.finding.result,
+        )
+    return result
+
+
+def _manifest_only_by_key(run: v2.RunRecord) -> dict[FindingKey, _ManifestRepresentative]:
+    result: dict[FindingKey, _ManifestRepresentative] = {}
+    for item in run.manifest_only_evidence:
+        key = finding_key(item.fingerprint)
+        if key in result:
+            raise ReportValidationError("generated manifest-only Finding keys are not unique")
+        result[key] = _ManifestRepresentative(
+            item.case,
+            item.fingerprint,
+            item.result,
+        )
+    return result
+
+
+def _finding_view(
+    index: int,
+    key: FindingKey,
+    occurrences: tuple[v2.OccurrenceRecord, ...],
+    saved: _SavedRepresentative | None,
+    manifest_only: _ManifestRepresentative | None,
+    replay: Mapping[str, ReplayClassification] | None,
+) -> FindingView:
+    representative = saved if saved is not None else manifest_only
+    if representative is None or finding_key(representative.fingerprint) != key:
+        raise ReportValidationError("generated Finding representative conflicts with its key")
+    result = representative.result
+    if result.fingerprint != representative.fingerprint:
+        raise ReportValidationError("generated Finding result conflicts with its fingerprint")
+    evidence, states = _evidence(saved, replay)
+    return FindingView(
+        label=f"F{index}",
+        participants=bounded_text(
+            _participants(representative.fingerprint),
+            MAX_SUMMARY_CHARS,
+        ),
+        stage=result.operation,
+        outcome_kind=bounded_text(
+            (
+                result.verdict.value
+                if result.diagnostic_kind == result.verdict.value
+                else f"{result.verdict.value} · {result.diagnostic_kind}"
+            ),
+            MAX_SUMMARY_CHARS,
+        ),
+        summary=bounded_text(result.detail.strip() or result.diagnostic_kind, MAX_SUMMARY_CHARS),
+        evidence_input=_input_summary(representative.case),
+        exact_location=bounded_text(result.schema_path, MAX_LOCATION_CHARS),
+        occurrence_count=len(occurrences),
+        distinct_input_count=len({item.case_id for item in occurrences}),
+        saved_replay_target_count=0 if saved is None else 1,
+        evidence_refs=evidence,
+        replay_state_counts=states,
     )
-    return f"{writer} → {roles.get('reader', 'write stage')}"
 
 
-def _brief(value: str) -> str:
-    limit = 120
-    return markdown_literal(value if len(value) <= limit else f"{value[: limit - 1]}…")
+def _evidence(
+    saved: _SavedRepresentative | None,
+    replay: Mapping[str, ReplayClassification] | None,
+) -> tuple[tuple[ArtifactRef, ...], tuple[ReplayStateCount, ...]]:
+    if saved is None:
+        return (
+            (ArtifactRef("run.json", "run.json"),),
+            (),
+        )
+    state = ReplayState.NOT_RUN
+    if replay is not None and saved.finding_id in replay:
+        state = ReplayState(replay[saved.finding_id].value)
+    return (
+        (
+            ArtifactRef(
+                "saved report",
+                f"findings/{saved.finding_id}/REPORT.md",
+            ),
+        ),
+        (ReplayStateCount(state, 1),),
+    )
 
 
-def _engines(engines: tuple[EngineVersion, ...]) -> str:
-    return ", ".join(f"{engine.name} {engine.version}" for engine in engines)
+def _participants(fingerprint: FailureFingerprint) -> str:
+    writer = fingerprint.writer
+    if fingerprint.writer_profile is not None:
+        writer += f" [{fingerprint.writer_profile.name}]"
+    return f"{writer} (write)" if fingerprint.reader == "*" else f"{writer} → {fingerprint.reader}"
 
 
-__all__ = ["render_run_report"]
+def _bounds(run: v2.RunRecord) -> tuple[DetailView, ...]:
+    return _discovery_bounds(run.command, run.discovery)
+
+
+def _discovery_bounds(
+    command: str,
+    discovery: DiscoveryEvidence,
+) -> tuple[DetailView, ...]:
+    if command == "check":
+        return ()
+    return (
+        DetailView("Examples", str(discovery.examples)),
+        DetailView("Seed", str(discovery.seed)),
+        DetailView("Reproducer limit", str(discovery.max_saved)),
+    )
+
+
+def _environment(run: v2.RunRecord) -> tuple[DetailView, ...]:
+    return environment_details(run.environment)
+
+
+def _provider_labels(providers: tuple[EngineVersion, ...]) -> tuple[str, ...]:
+    return tuple(sorted(f"{item.name} {item.version}" for item in providers))
+
+
+def _run_summary(
+    command: str,
+    evaluated: int,
+    executed: int,
+    failures: int,
+    failed_paths: int,
+    saved: int,
+    stop_reason: str,
+) -> str:
+    if command == "check":
+        if not failures:
+            return f"The supplied table passed all {_count(executed, 'engine path')}."
+        base = f"{failed_paths} of {executed} engine paths failed on the supplied table."
+        return f"{base} {_saved_reproducers(failures, saved)}"
+    if not failures:
+        base = f"Parquity tested {_count(evaluated, 'generated table')} and found no failures."
+        return _with_exhaustion_note(base, stop_reason)
+    base = (
+        f"Parquity tested {_count(evaluated, 'generated table')} and found "
+        f"{_count(failures, 'distinct failure')}."
+    )
+    remaining = failures - saved
+    if remaining and stop_reason == SAVED_EVIDENCE_LIMIT_REACHED:
+        return (
+            f"{base} It stopped after saving {_count(saved, 'reproducer')}; "
+            f"{_remaining(remaining)} in run.json."
+        )
+    return _with_exhaustion_note(f"{base} {_saved_reproducers(failures, saved)}", stop_reason)
+
+
+def _with_exhaustion_note(summary: str, stop_reason: str) -> str:
+    if stop_reason == STRATEGY_EXHAUSTED:
+        return f"{summary} Generation stopped because the schema produced no more distinct tables."
+    return summary
+
+
+def _saved_reproducers(failures: int, saved: int) -> str:
+    if saved == failures:
+        return "A reproducer was saved for each."
+    remaining = failures - saved
+    return (
+        f"{_count(saved, 'reproducer').capitalize()} "
+        f"{'was' if saved == 1 else 'were'} saved; {_remaining(remaining)} in run.json."
+    )
+
+
+def _remaining(value: int) -> str:
+    return f"the other {'remains' if value == 1 else f'{value} remain'}"
+
+
+def _count(value: int, singular: str) -> str:
+    return f"{value} {singular if value == 1 else singular + 's'}"
+
+
+def _input_summary(case: Case) -> str:
+    schema = "; ".join(
+        f"{type_label(field.type_spec)}{'?' if field.nullable else ''}" for field in case.fields
+    )
+    rows = f"{len(case.rows)} {'row' if len(case.rows) == 1 else 'rows'}"
+    columns = f"{len(case.fields)} {'column' if len(case.fields) == 1 else 'columns'}"
+    return bounded_text(f"{rows} · {columns} · {schema}", MAX_SUMMARY_CHARS)
+
+
+def _stop_label(value: str) -> str:
+    labels = {
+        CHECK_COMPLETE: "Supplied Input evaluated",
+        EXAMPLE_BOUND_REACHED: "Example bound reached",
+        STRATEGY_EXHAUSTED: "Input strategy exhausted",
+        SAVED_EVIDENCE_LIMIT_REACHED: "Saved-evidence limit reached",
+    }
+    try:
+        return labels[value]
+    except KeyError as error:
+        raise ReportValidationError("generated stop reason is not recognized") from error
+
+
+__all__ = ["build_clean_run_report_view", "build_run_report_view"]

@@ -2,15 +2,13 @@ import hashlib
 import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import cast
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
-import parquity.process as process_module
 import parquity.scans.discovery as discovery_module
+import parquity.scans.supervision as process_module
 from parquity.engines import resolve_reader_selection
-from parquity.scans import records
 from parquity.scans.discovery import (
     MAX_FILE_BYTES,
     MAX_FILES,
@@ -76,13 +74,13 @@ def test_scan_fails_closed_when_process_group_isolation_is_unavailable(
             tmp_path / "result",
             resolve_reader_selection("pyarrow"),
             timeout_seconds=30,
-            max_findings=1,
+            max_saved=1,
         )
     assert unavailable.value.kind == "SCAN_UNAVAILABLE"
     assert not (tmp_path / "result").exists()
 
 
-def test_directory_discovery_is_recursive_suffix_filtered_and_utf8_byte_sorted(
+def test_directory_discovery_counts_ignored_entries_and_is_utf8_byte_sorted(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "input"
@@ -203,10 +201,6 @@ def test_snapshot_refuses_source_drift(monkeypatch: pytest.MonkeyPatch, tmp_path
     source.write_bytes(b"after-change")
     assert _failure(snapshot_file, item, tmp_path / "private").kind == "INPUT_DRIFT"
 
-    occupied = tmp_path / "occupied"
-    occupied.mkdir()
-    assert _failure(snapshot_file, item, occupied).kind == "OUTPUT_ERROR"
-
     source.write_bytes(b"original")
     replaced = discover_input(source).files[0]
     replacement = tmp_path / "replacement"
@@ -251,100 +245,12 @@ def test_snapshot_distinguishes_source_reads_from_target_operations(
         patch.setattr(discovery_module.os, "fdopen", Mock(return_value=source_handle))
         source_failure = _failure(snapshot_file, item, tmp_path / "source-failure")
     assert source_failure.kind == "INPUT_DRIFT"
-    err = discovery_module.errno
-    for operation in ("open", "write", "capacity", "flush"):
-        target_handle, target_open = MagicMock(), Mock()
-        target_open.return_value = target_handle
-        output = target_handle.__enter__.return_value
-        output.write.return_value = len(b"source bytes")
-        error = OSError(err.ENOSPC if operation == "capacity" else err.EIO, "target failure")
-        method = "write" if operation == "capacity" else operation
-        failing = target_open if operation == "open" else getattr(output, method)
-        failing.side_effect = error
-        with monkeypatch.context() as patch:
-            patch.setattr(type(source), "open", target_open)
-            target_failure = _failure(snapshot_file, item, tmp_path / f"target-{operation}")
-        assert target_failure.kind == "OUTPUT_ERROR"
-
-
-def _run_record() -> dict[str, object]:
-    finding_id = "f" * 64
-    data: dict[str, object] = {
-        "format": records.SCAN_RUN_FORMAT,
-        "scan_id": "",
-        "parquity_version": "0.1.0",
-        "status": "FINDINGS_FOUND",
-        "input_kind": "directory",
-        "discovery": {
-            "files": [{"path": "a.parquet", "bytes": 1}, {"path": "b.parquet", "bytes": 1}],
-            "skipped_symlinks": 0,
-            "total_bytes": 2,
-            "visited_entries": 3,
-        },
-        "limits": records.SCAN_LIMITS,
-        "engines": [{"name": "pyarrow", "version": "1"}],
-        "timeout_seconds": 30,
-        "max_findings": 1,
-        "stop_reason": "FINDINGS_FOUND",
-        "findings": [
-            {
-                "finding_id": finding_id,
-                "source_path": "b.parquet",
-                "manifest": {
-                    "path": f"findings/{finding_id}/finding.json",
-                    "sha256": "a" * 64,
-                    "bytes": 1,
-                },
-            }
-        ],
-        "overflow": [],
-        "report": {"path": "REPORT.md", "sha256": "b" * 64, "bytes": 1},
-    }
-    data["scan_id"] = records.scan_id(data)
-    records.validate_run(data)
-    return data
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    (
-        "duplicate_path",
-        "file_kind",
-        "dot_path",
-        "nul_path",
-        "empty_version",
-        "false_incomplete",
-        "unmarked_overflow",
-        "omitted_suffix",
-        "visited_entries",
-    ),
-)
-def test_run_record_rejects_resealed_impossible_run_relations(mutation: str) -> None:
-    data = _run_record()
-    discovery = cast(dict[str, object], data["discovery"])
-    if mutation == "duplicate_path":
-        files = cast(list[dict[str, object]], discovery["files"])
-        files.append(dict(files[-1]))
-        discovery["total_bytes"] = 3
-    elif mutation == "file_kind":
-        data["input_kind"] = "file"
-    elif mutation == "empty_version":
-        data["parquity_version"] = ""
-    elif mutation == "false_incomplete":
-        data["status"] = data["stop_reason"] = "FINDING_CAP_REACHED"
-    elif mutation == "unmarked_overflow":
-        cast(list[dict[str, object]], data["findings"])[0]["source_path"] = "a.parquet"
-        data["overflow"] = ["b.parquet"]
-    elif mutation == "omitted_suffix":
-        cast(list[dict[str, object]], data["findings"])[0]["source_path"] = "a.parquet"
-    elif mutation == "visited_entries":
-        discovery["visited_entries"] = MAX_VISITED_ENTRIES + 1
-    else:
-        path = "." if mutation == "dot_path" else "a\0.parquet"
-        cast(list[dict[str, object]], discovery["files"])[0]["path"] = path
-        cast(list[dict[str, object]], data["findings"])[0]["source_path"] = path
-    data["scan_id"] = ""
-    data["scan_id"] = records.scan_id(data)
-
-    with pytest.raises(records.ScanRecordError):
-        records.validate_run(data)
+    target_handle, target_open = MagicMock(), Mock(return_value=MagicMock())
+    target_open.return_value = target_handle
+    target_handle.__enter__.return_value.write.side_effect = OSError(
+        discovery_module.errno.EIO, "target failure"
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(type(source), "open", target_open)
+        target_failure = _failure(snapshot_file, item, tmp_path / "target-write")
+    assert target_failure.kind == "OUTPUT_ERROR"

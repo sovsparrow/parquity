@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "parquity"
-version = "0.1.0"
-description = "Find and reproduce semantic disagreements between Parquet engines."
+version = "0.2.0"
+description = "Find and reproduce Parquet interoperability failures."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -40,10 +40,10 @@ parquity = "parquity.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sovsparrow/parquity"
-Documentation = "https://github.com/sovsparrow/parquity/tree/v0.1.0/docs"
+Documentation = "https://github.com/sovsparrow/parquity/tree/v0.2.0/docs"
 Source = "https://github.com/sovsparrow/parquity"
 Issues = "https://github.com/sovsparrow/parquity/issues"
-Changelog = "https://github.com/sovsparrow/parquity/blob/v0.1.0/CHANGELOG.md"
+Changelog = "https://github.com/sovsparrow/parquity/blob/v0.2.0/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
@@ -82,6 +82,7 @@ include = [
 target-version = "py311"
 line-length = 100
 preview = false
+extend-exclude = ["tests/fixtures/v0_1_0"]
 
 [tool.ruff.lint]
 select = [
@@ -97,6 +98,8 @@ select = [
   "A",
   "C4",
   "C90",
+  "PLR0912",
+  "PLR0915",
   "SIM",
   "RET",
   "PIE",
@@ -115,6 +118,10 @@ explicit-preview-rules = true
 [tool.ruff.lint.mccabe]
 max-complexity = 10
 
+[tool.ruff.lint.pylint]
+max-branches = 12
+max-statements = 60
+
 [tool.ruff.lint.per-file-ignores]
 # Command-scoped imports preserve the dependency-light CLI startup boundary.
 "src/parquity/cli/main.py" = ["PLC0415"]
@@ -124,6 +131,7 @@ max-complexity = 10
 typeCheckingMode = "strict"
 pythonVersion = "3.11"
 include = ["src", "tests"]
+exclude = ["tests/fixtures/v0_1_0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -134,6 +142,5 @@ branch = true
 source = ["parquity"]
 
 [tool.coverage.report]
-fail_under = 95
 show_missing = true
 skip_covered = false

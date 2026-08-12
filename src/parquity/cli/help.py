@@ -1,52 +1,74 @@
 from __future__ import annotations
 
-import os
 import re
 import sys
 
 from .parser import HelpArguments
+from .spec import (
+    COMMAND_SPECS,
+    ENGINES,
+    EXAMPLES,
+    FUZZ_MAX_SAVED,
+    HELP_FLAGS,
+    JSON,
+    NO_WRITER_PROFILES,
+    OUT,
+    READERS,
+    SCAN_MAX_SAVED,
+    SCAN_TIMEOUT,
+    SCHEMA,
+    SEED,
+    VERSION_FLAG,
+    WRITER_PROFILES,
+    WRITERS,
+    Command,
+)
+from .style import Style, controls_enabled
 
-_TOP_LEVEL = """Usage: parquity COMMAND [OPTIONS] [--json]
-       parquity --help | -h | --version [--json]
+_COMMAND_DESCRIPTIONS = {
+    Command.ENGINES: "Report installed Parquet engines and their capabilities.",
+    Command.SMOKE: "Run the built-in compatibility case across the core engines.",
+    Command.CHECK: "Check a known table against selected writers and readers.",
+    Command.FUZZ: "Search generated tables for engine disagreements.",
+    Command.SCAN: "Compare reader observations of existing Parquet files.",
+    Command.REPLAY: "Re-evaluate a saved reproducer or run.",
+}
+_COMMAND_LINES = "\n".join(
+    f"  {spec.command.value:<8} {_COMMAND_DESCRIPTIONS[spec.command]}" for spec in COMMAND_SPECS
+)
+_TOP_LEVEL = f"""Usage: parquity COMMAND [OPTIONS] [{JSON.name}]
+       parquity {HELP_FLAGS[0]} | {HELP_FLAGS[1]} | {VERSION_FLAG} [{JSON.name}]
 
 Commands:
-  engines  Report installed Parquet engines and their capabilities.
-  smoke    Run the built-in compatibility case across the core engines.
-  check    Check a known Case against selected writers and readers.
-  fuzz     Search generated Cases for engine disagreements.
-  scan     Compare reader observations of existing Parquet files.
-  replay   Re-evaluate a saved finding or aggregate run.
-  triage   Inspect or filter symptom families in a saved aggregate run.
+{_COMMAND_LINES}
 
 Options:
-  --help, -h  Show this help and exit.
-  --json      Force canonical JSON output, including on a terminal.
-  --version   Show the installed Parquity version and exit.
+  {HELP_FLAGS[0]}, {HELP_FLAGS[1]}  Show this help and exit.
+  {JSON.name}      Force canonical JSON output, including on a terminal.
+  {VERSION_FLAG}   Show the installed Parquity version and exit.
 
-Run 'parquity COMMAND --help' for command-specific help.
+Run 'parquity COMMAND {HELP_FLAGS[0]}' for command-specific help.
 """
 
 _SECTION = re.compile(r"^(Usage|Commands|Operands|Required options|Options|Examples|Exit status):")
 _ENTRY = re.compile(r"^(  )(\S(?:.*?\S)?)( {2,})(\S.*)$")
-_BOLD = "\x1b[1m"
-_ACCENT = "\x1b[38;2;220;113;84m"
-_RESET = "\x1b[0m"
+_OPTION_ENTRY = re.compile(r"^  (--[a-z-]+)(?:\s|,)")
 
 _EXIT_GENERAL = """Exit status:
-  0  The command completed without a finding.
-  1  A finding was observed.
+  0  The command completed without a failure.
+  1  At least one failure was recorded.
   2  Usage, input, provider, resource, output, or evidence validation failed.
   3  An unexpected internal failure prevented a valid result.
 """
 
 _HELP = {
-    "engines": """Usage: parquity engines [--json] [--help | -h]
+    Command.ENGINES.value: f"""Usage: parquity engines [{JSON.name}] [{HELP_FLAGS[0]} | {HELP_FLAGS[1]}]
 
 Report installed Parquet engines, versions, capabilities, and Python support.
 
 Options:
-  --json      Force canonical JSON output.
-  --help, -h  Show this help and exit.
+  {JSON.name}      Force canonical JSON output.
+  {HELP_FLAGS[0]}, {HELP_FLAGS[1]}  Show this help and exit.
 
 Exit status:
   0  Engine information was reported.
@@ -54,13 +76,13 @@ Exit status:
   2  Not used by this command.
   3  An unexpected internal failure prevented a valid result.
 """,
-    "smoke": """Usage: parquity smoke [--json] [--help | -h]
+    Command.SMOKE.value: f"""Usage: parquity smoke [{JSON.name}] [{HELP_FLAGS[0]} | {HELP_FLAGS[1]}]
 
 Run the built-in compatibility case across the core writers and readers.
 
 Options:
-  --json      Force canonical JSON output.
-  --help, -h  Show this help and exit.
+  {JSON.name}      Force canonical JSON output.
+  {HELP_FLAGS[0]}, {HELP_FLAGS[1]}  Show this help and exit.
 
 Exit status:
   0  Every smoke-test cell passed.
@@ -68,64 +90,68 @@ Exit status:
   2  A required core provider was unavailable.
   3  An unexpected internal failure prevented a valid result.
 """,
-    "check": """Usage: parquity check CASE_FILE --out OUTPUT_DIR [--writers NAMES] [--readers NAMES]
-       [--writer-profiles NAMES] [--json] [--help | -h]
+    Command.CHECK.value: f"""Usage: parquity check CASE_FILE {OUT.name} OUTPUT_DIR [{WRITERS.name} NAMES] [{READERS.name} NAMES]
+       [{WRITER_PROFILES.name} NAMES] [{JSON.name}] [{HELP_FLAGS[0]} | {HELP_FLAGS[1]}]
 
-Check a known Case against selected Parquet writers and readers.
+Check a known table against selected Parquet writers and readers.
 
 Operands:
-  CASE_FILE              Path to a Case file containing the expected schema and rows.
+  CASE_FILE              Path to a JSON table description with expected schema and rows.
 
 Required options:
-  --out OUTPUT_DIR       Destination for a published finding run.
+  {OUT.name} OUTPUT_DIR       Destination for check results and reproducers.
 
 Options:
-  --writers NAMES        Comma-separated writer engine names
-                         (default: pyarrow,duckdb,polars).
-  --readers NAMES        Comma-separated reader engine names
-                         (default: pyarrow,duckdb,polars).
-  --writer-profiles NAMES
-                         Comma-separated writer profile names (default: none).
-  --json                 Force canonical JSON output.
-  --help, -h             Show this help and exit.
+  {WRITERS.name} NAMES        Comma-separated writer engine names
+                         (default: {WRITERS.default}).
+  {READERS.name} NAMES        Comma-separated reader engine names
+                         (default: {READERS.default}).
+  {WRITER_PROFILES.name} NAMES
+                         Comma-separated writer profile names (default: {NO_WRITER_PROFILES}).
+  {JSON.name}                 Force canonical JSON output.
+  {HELP_FLAGS[0]}, {HELP_FLAGS[1]}             Show this help and exit.
 
 Examples:
-  parquity check ./case.json --out ./check-run
+  parquity check ./case.json {OUT.name} ./check-run
 
 """
     + _EXIT_GENERAL,
-    "fuzz": """Usage: parquity fuzz --examples N --seed N --out OUTPUT_DIR [--schema CASE_FILE]
-       [--max-findings N] [--writers NAMES] [--readers NAMES]
-       [--writer-profiles NAMES] [--json] [--help | -h]
+    Command.FUZZ.value: f"""Usage: parquity fuzz {EXAMPLES.name} N {SEED.name} N {OUT.name} OUTPUT_DIR [{SCHEMA.name} CASE_FILE]
+       [{FUZZ_MAX_SAVED.name} N] [{WRITERS.name} NAMES] [{READERS.name} NAMES]
+       [{WRITER_PROFILES.name} NAMES] [{JSON.name}] [{HELP_FLAGS[0]} | {HELP_FLAGS[1]}]
 
-Search generated Cases for semantic disagreements between Parquet engines.
+Search generated tables for semantic disagreements between Parquet engines.
 
 Required options:
-  --examples N           Maximum number of discovery examples.
-  --seed N               Seed in [0, 18446744073709551615].
-  --out OUTPUT_DIR       Destination for a published finding run.
+  {EXAMPLES.name} N           Maximum number of discovery examples.
+  {SEED.name} N               Seed in [{SEED.minimum}, {SEED.maximum}].
+  {OUT.name} OUTPUT_DIR       Destination for fuzz results and reproducers.
 
 Options:
-  --schema CASE_FILE     Generate rows under the Case file's fixed schema;
+  {SCHEMA.name} CASE_FILE     Generate rows under Case grammar with `rows: []`;
                          omit to generate both schema and rows.
-  --max-findings N       Retain 1 to 64 findings (default: 8).
-  --writers NAMES        Comma-separated writer engine names
-                         (default: pyarrow,duckdb,polars).
-  --readers NAMES        Comma-separated reader engine names
-                         (default: pyarrow,duckdb,polars).
-  --writer-profiles NAMES
-                         Comma-separated writer profile names (default: none).
-  --json                 Force canonical JSON output.
-  --help, -h             Show this help and exit.
+  {FUZZ_MAX_SAVED.name} N          Save {FUZZ_MAX_SAVED.minimum} to {FUZZ_MAX_SAVED.maximum} reproducers
+                         (default: {FUZZ_MAX_SAVED.default}).
+  {WRITERS.name} NAMES        Comma-separated writer engine names
+                         (default: {WRITERS.default}).
+  {READERS.name} NAMES        Comma-separated reader engine names
+                         (default: {READERS.default}).
+  {WRITER_PROFILES.name} NAMES
+                         Comma-separated writer profile names (default: {NO_WRITER_PROFILES}).
+  {JSON.name}                 Force canonical JSON output.
+  {HELP_FLAGS[0]}, {HELP_FLAGS[1]}             Show this help and exit.
 
-The example limit and finding cap are competing bounds. A fingerprint beyond
-the finding cap is recorded as overflow and stops discovery early. Overflow is
-a known lower bound, not a count of every result that remained undiscovered.
+Equivalent generated failures share one reproducer. The selected exact failure
+remains the minimization and replay input. Discovery stops after finding a
+distinct failure beyond the {FUZZ_MAX_SAVED.name} limit, or after the requested
+examples are evaluated. Each reproducer includes the exact table and result.
+
+The schema file is a parquity.case.v1 Case whose rows array must be empty.
 
 """
     + _EXIT_GENERAL,
-    "scan": """Usage: parquity scan FILE_OR_DIR --out OUTPUT_DIR [--engines NAMES]
-       [--timeout SECONDS] [--max-findings N] [--json] [--help | -h]
+    Command.SCAN.value: f"""Usage: parquity scan FILE_OR_DIR {OUT.name} OUTPUT_DIR [{ENGINES.name} NAMES]
+       [{SCAN_TIMEOUT.name} SECONDS] [{SCAN_MAX_SAVED.name} N] [{JSON.name}] [{HELP_FLAGS[0]} | {HELP_FLAGS[1]}]
 
 Compare independent reader observations of existing Parquet files.
 
@@ -133,108 +159,99 @@ Operands:
   FILE_OR_DIR            Parquet file or directory to scan.
 
 Required options:
-  --out OUTPUT_DIR       Destination for a published scan run.
+  {OUT.name} OUTPUT_DIR       Destination for scan results and reproducers.
 
 Options:
-  --engines NAMES        Comma-separated reader engine names
-                         (default: pyarrow,duckdb,polars).
-  --timeout SECONDS      Per reader-file timeout in [1, 300] (default: 30).
-  --max-findings N       Retain 1 to 64 findings (default: 32).
-  --json                 Force canonical JSON output.
-  --help, -h             Show this help and exit.
+  {ENGINES.name} NAMES        Comma-separated reader engine names
+                         (default: {ENGINES.default}).
+  {SCAN_TIMEOUT.name} SECONDS      Per reader-file timeout in [{SCAN_TIMEOUT.minimum}, {SCAN_TIMEOUT.maximum}] (default: {SCAN_TIMEOUT.default}).
+  {SCAN_MAX_SAVED.name} N          Save evidence for {SCAN_MAX_SAVED.minimum} to {SCAN_MAX_SAVED.maximum} source files (default: {SCAN_MAX_SAVED.default}).
+  {JSON.name}                 Force canonical JSON output.
+  {HELP_FLAGS[0]}, {HELP_FLAGS[1]}             Show this help and exit.
 
 """
     + _EXIT_GENERAL,
-    "replay": """Usage: parquity replay RUN_DIR [--json] [--help | -h]
+    Command.REPLAY.value: f"""Usage: parquity replay RUN_DIR [{JSON.name}] [{HELP_FLAGS[0]} | {HELP_FLAGS[1]}]
 
-Re-evaluate a saved finding or aggregate run against its recorded target.
+Re-evaluate a saved reproducer or run against its recorded failure.
 
 Operands:
-  RUN_DIR     Saved finding or aggregate run directory.
+  RUN_DIR     Saved reproducer or run directory.
 
 Options:
-  --json      Force canonical JSON output.
-  --help, -h  Show this help and exit.
+  {JSON.name}      Force canonical JSON output.
+  {HELP_FLAGS[0]}, {HELP_FLAGS[1]}  Show this help and exit.
 
 Exit status:
   0  No recorded target reproduced exactly.
   1  At least one recorded target reproduced exactly.
-  2  Provider, bundle, or recorded evidence validation failed.
-  3  An unexpected internal failure prevented a valid result.
-""",
-    "triage": """Usage: parquity triage RUN_DIR [--focus all|execution|data|schema]
-       [--replay-evidence FILE] [--json] [--help | -h]
-
-Inspect or filter symptom families in a saved aggregate run.
-
-Operands:
-  RUN_DIR                 Saved aggregate run directory.
-
-Options:
-  --focus all|execution|data|schema
-                          Select displayed families (default: all).
-  --replay-evidence FILE  Bind canonical replay JSON to the triage view;
-                          omit to report replay state as NOT_CHECKED.
-  --json                  Force canonical JSON output.
-  --help, -h              Show this help and exit.
-
-Exit status:
-  0  Triage completed.
-  1  Not used by this command.
-  2  Bundle, focus, or replay-evidence validation failed.
+  2  Provider, run, or recorded evidence validation failed.
   3  An unexpected internal failure prevented a valid result.
 """,
 }
 
 
-def _styled(value: str, code: str, enabled: bool) -> str:
-    return f"{code}{value}{_RESET}" if enabled else value
+def _section_options(document: str, heading: str) -> set[str]:
+    marker = f"\n{heading}:\n"
+    if marker not in document:
+        return set()
+    body = document.split(marker, 1)[1].split("\n\n", 1)[0]
+    return {
+        matched.group(1)
+        for line in body.splitlines()
+        if (matched := _OPTION_ENTRY.match(line)) is not None
+    }
 
 
-def _banner(color: bool) -> str:
-    def bold(value: str) -> str:
-        return _styled(value, _BOLD, color)
+def _validate_help_inventory() -> None:
+    for spec in COMMAND_SPECS:
+        document = _HELP[spec.command.value]
+        required = set(spec.required_names)
+        optional = set(spec.option_names) - required
+        optional.update((JSON.name, HELP_FLAGS[0]))
+        if _section_options(document, "Required options") != required:
+            raise RuntimeError(f"{spec.command.value} help required options conflict with spec")
+        if _section_options(document, "Options") != optional:
+            raise RuntimeError(f"{spec.command.value} help options conflict with spec")
 
-    def accent(value: str) -> str:
-        return _styled(value, _ACCENT, color)
 
+_validate_help_inventory()
+
+
+def _banner(style: Style) -> str:
     return (
-        f"  {bold('╭────╮')}\n"
-        f"  {bold('│    │')}   {bold('parquity')}\n"
-        f"  {bold('╰────┤')}   Find and reproduce semantic disagreements\n"
-        f"       {bold('│')}{accent('╲')}  between Parquet engines.\n"
-        f"       {bold('│')} {accent('╲')}\n\n"
+        f"  {style.bold('╭────╮')}\n"
+        f"  {style.bold('│    │')}   {style.bold('parquity')}\n"
+        f"  {style.bold('╰────┤')}   Find and reproduce semantic disagreements\n"
+        f"       {style.bold('│')}{style.accent('╲')}  between Parquet engines.\n"
+        f"       {style.bold('│')} {style.accent('╲')}\n\n"
     )
 
 
-def _colorize(document: str) -> str:
+def _colorize(document: str, style: Style) -> str:
     rendered: list[str] = []
     for line in document.splitlines(keepends=True):
         content = line.removesuffix("\n")
         ending = "\n" if line.endswith("\n") else ""
         if section := _SECTION.match(content):
             label = section.group(0)
-            content = f"{_BOLD}{label}{_RESET}{content[len(label) :]}"
+            content = f"{style.bold(label)}{content[len(label) :]}"
         elif entry := _ENTRY.match(content):
             content = (
-                f"{entry.group(1)}{_ACCENT}{entry.group(2)}{_RESET}{entry.group(3)}{entry.group(4)}"
+                f"{entry.group(1)}{style.accent(entry.group(2))}{entry.group(3)}{entry.group(4)}"
             )
         elif content.startswith("  --"):
-            content = f"  {_ACCENT}{content[2:]}{_RESET}"
+            content = f"  {style.accent(content[2:])}"
         rendered.append(content + ending)
     return "".join(rendered)
 
 
-def _use_color() -> bool:
-    return "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb" and sys.stdout.isatty()
-
-
 def render(arguments: HelpArguments) -> None:
-    color = _use_color()
+    style = Style(controls_enabled(sys.stdout))
     document = _TOP_LEVEL if arguments.command is None else _HELP[arguments.command]
-    output = _colorize(document) if color else document
+    output = _colorize(document, style) if style.controls else document
     if arguments.command is None:
-        output = _banner(color) + output
+        output = _banner(style) + output
     print(output, end="")
 
 

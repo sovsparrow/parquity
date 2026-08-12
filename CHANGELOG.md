@@ -7,6 +7,45 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-12
+
+### Added
+
+- Generate deterministic Markdown reports for `check`, `fuzz`, and `scan`.
+  Reports summarize failures, link to saved reproducers, and record the command
+  and environment needed to reproduce the run.
+- Publish new generated evidence as `parquity.run.v2` and new scan evidence as
+  `parquity.scan-run.v2` and `parquity.scan-finding.v2`. Released v1 bundles
+  remain readable and replayable.
+- Keep generated failures beyond the reproducer limit represented in
+  `run.json`.
+- Record Python, platform, provider, and dependency versions in new scan
+  evidence.
+
+### Changed
+
+- Rename `--max-findings` to `--max-saved` for `fuzz` and `scan`.
+- Let equivalent generated failures share one minimized reproducer while
+  retaining the affected Case identities in `run.json`.
+- Show replay results through the same report format used by the original run.
+- Preserve structural depth and map/list roles while deduplicating generated
+  failures across field and row indexes.
+
+### Fixed
+
+- Distinguish missing paths, unsupported directories, and malformed bundles
+  when replay input is invalid.
+- Preserve complete scan diagnostics in standalone reports.
+- Prevent provider output from corrupting scan worker control messages.
+- Treat supported equivalent Arrow schema representations as equal during scan
+  comparison.
+- Report finite-strategy exhaustion without claiming that the requested
+  example bound was reached.
+
+### Removed
+
+- Remove the `triage` command. Use `replay` to re-evaluate saved evidence.
+
 ## [0.1.0] - 2026-08-09
 
 ### Added
@@ -30,5 +69,6 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
   selected writer supports them.
 - Support Python 3.11 through 3.14 and ship typed package metadata.
 
-[Unreleased]: https://github.com/sovsparrow/parquity/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sovsparrow/parquity/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sovsparrow/parquity/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sovsparrow/parquity/releases/tag/v0.1.0

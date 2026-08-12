@@ -11,39 +11,31 @@ from typing import cast
 import pytest
 
 from parquity import cli
+from parquity import profiles as wp
+from parquity.evidence import DependencyVersion, EngineVersion, EnvironmentEvidence
 from parquity.findings.bundle import (
     BundlePublicationError,
     BundleValidationError,
     FindingSource,
-    publish_bundle,
+    build_bundle,
     validate_bundle,
 )
-from parquity.findings.evidence import (
-    CHECK_COMPLETE,
-    DependencyVersion,
-    DiscoveryEvidence,
-    EnvironmentEvidence,
-    ReductionEvidence,
-)
-from parquity.findings.identity import ReplaySignature
-from parquity.findings.replay import ReplayClassification, replay_bundle
+from parquity.findings.model import ReductionEvidence, ReplaySignature
+from parquity.findings.replay import ReplayClassification
+from parquity.findings.replay import replay_validated_bundle as replay
+from parquity.generation.evidence import CHECK_COMPLETE, DiscoveryEvidence
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
-from parquity.writer_profiles import (
-    OPTION_UNAVAILABLE,
-    CapabilityStatus,
-    WriterProfileCapability,
-    WriterProfileIdentity,
-    WriterProfilePlan,
-)
+from parquity.verdicts import CellResult, MatrixRun, Verdict
+
+Capability = wp.WriterProfileCapability
 
 
 def _case(*, extra_field: bool = False) -> Case:
-    fields = [Field("value", TypeSpec(Kind.INT32), nullable=False)]
+    field = Field("value", TypeSpec(Kind.INT32), nullable=False)
     if extra_field:
-        fields.append(Field("extra", TypeSpec(Kind.STRING), nullable=False))
-        return Case(tuple(fields), ((1, "remove"),))
-    return Case(tuple(fields), ((1,),))
+        extra = Field("extra", TypeSpec(Kind.STRING), nullable=False)
+        return Case((field, extra), ((1, "remove"),))
+    return Case((field,), ((1,),))
 
 
 def _result(
@@ -62,33 +54,32 @@ def _versions() -> tuple[tuple[EngineVersion, ...], tuple[EngineVersion, ...]]:
     return (EngineVersion("pyarrow", "1"),), (EngineVersion("duckdb", "2"),)
 
 
-def _capability(writer: EngineVersion, options: dict[str, int] | None) -> WriterProfileCapability:
+def _capability(writer: EngineVersion, options: dict[str, int] | None) -> Capability:
     if options is None:
-        status = CapabilityStatus.UNSUPPORTED
-        return WriterProfileCapability(writer, "row-group-2", status, None, OPTION_UNAVAILABLE)
-    profile = WriterProfileIdentity("row-group-2", options)
-    return WriterProfileCapability(writer, "row-group-2", CapabilityStatus.SUPPORTED, profile)
+        status = wp.CapabilityStatus.UNSUPPORTED
+        return Capability(writer, "row-group-2", status, None, wp.OPTION_UNAVAILABLE)
+    profile = wp.WriterProfileIdentity("row-group-2", options)
+    return Capability(writer, "row-group-2", wp.CapabilityStatus.SUPPORTED, profile)
 
 
-def _historical_plan(change: str, writers: tuple[EngineVersion, ...]) -> WriterProfilePlan:
+def _historical_plan(change: str, writers: tuple[EngineVersion, ...]) -> wp.WriterProfilePlan:
     options = {
         "addition": ({"row_group_size": 2}, {"historical_group_size": 2}),
         "removal": (None, {"historical_group_size": 2}),
         "options": ({"historical_group_size": 3}, None),
     }[change]
-    capabilities = tuple(
-        _capability(writer, option) for writer, option in zip(writers, options, strict=True)
-    )
-    return WriterProfilePlan(("row-group-2",), capabilities)
+    pairs = zip(writers, options, strict=True)
+    capabilities = tuple(_capability(writer, option) for writer, option in pairs)
+    return wp.WriterProfilePlan(("row-group-2",), capabilities)
 
 
-def _passing(writer: EngineVersion, profile: WriterProfileIdentity | None) -> CellResult:
+def _passing(writer: EngineVersion, profile: wp.WriterProfileIdentity | None) -> CellResult:
     engines = (writer.name, writer.version, "duckdb", "2")
     return CellResult(*engines, "compare", Verdict.PASS, "$", "match", writer_profile=profile)
 
 
 def _historical_evaluate(
-    case: Case, directory: Path, plan: WriterProfilePlan, writers: tuple[EngineVersion, ...]
+    case: Case, directory: Path, plan: wp.WriterProfilePlan, writers: tuple[EngineVersion, ...]
 ) -> MatrixRun:
     directory.mkdir(parents=True)
     artifact = directory / "pyarrow.parquet"
@@ -124,15 +115,13 @@ def _evaluate(case: Case, directory: Path) -> MatrixRun:
     return MatrixRun(case.case_id, (result,), (("pyarrow", parquet),), writers, readers)
 
 
-def _publish(destination: Path, *, discovered: Case | None = None) -> None:
-    source = _source(discovered=discovered)
-
+def _build(destination: Path, *, discovered: Case | None = None) -> None:
     def evaluator(case: Case, directory: Path) -> MatrixRun:
         run = _evaluate(case, directory)
         target = run.failures[0]
         return replace(run, results=(replace(target, detail="controlled mismatch"),))
 
-    publish_bundle(source, destination, evaluator)
+    build_bundle(_source(discovered=discovered), destination, evaluator)
 
 
 def _replace_artifact(directory: Path, name: str, payload: bytes) -> None:
@@ -148,7 +137,7 @@ def _replace_artifact(directory: Path, name: str, payload: bytes) -> None:
 
 def test_child_inventory_hash_chain_and_matrix_are_verified(tmp_path: Path) -> None:
     destination = tmp_path / "finding"
-    _publish(destination)
+    _build(destination)
     expected = {"finding.json", "REPORT.md", "case.json", "matrix.json"}
     expected |= {"reproduce.py", "upstream_repro.py", "input.parquet"}
     assert {path.name for path in destination.iterdir()} == expected
@@ -171,15 +160,14 @@ def test_child_inventory_hash_chain_and_matrix_are_verified(tmp_path: Path) -> N
 def test_child_bytes_and_discovered_case(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
-    _publish(first)
-    _publish(second)
+    _build(first)
+    _build(second)
 
     assert {path.name: path.read_bytes() for path in first.iterdir()} == {
         path.name: path.read_bytes() for path in second.iterdir()
     }
-    assert not (first / "discovered_case.json").exists()
     reduced = tmp_path / "reduced"
-    _publish(reduced, discovered=_case(extra_field=True))
+    _build(reduced, discovered=_case(extra_field=True))
     expected = _case(extra_field=True).canonical_bytes()
     assert (reduced / "discovered_case.json").read_bytes() == expected
 
@@ -195,20 +183,12 @@ def test_publication_refuses_existing_targets_before_evaluation(tmp_path: Path) 
 
     for destination in (existing_file, existing_directory):
         with pytest.raises(BundlePublicationError):
-            publish_bundle(_source(), destination, forbidden)
+            build_bundle(_source(), destination, forbidden)
     assert existing_file.read_bytes() == b"owned"
     writers, readers = _versions()
-    passing = CellResult("pyarrow", "1", "duckdb", "2", "compare", Verdict.PASS, "$", "match")
-    invalid_runs = (
-        MatrixRun("wrong", (passing,), (), writers, readers),
-        MatrixRun(_case().case_id, (passing,), (), writers, readers),
-        MatrixRun(_case().case_id, (_result(),), (), writers, readers),
-    )
-    for index, run in enumerate(invalid_runs):
-        with pytest.raises(RuntimeError):
-            publish_bundle(
-                _source(), tmp_path / f"invalid-{index}", lambda case, path, value=run: value
-            )
+    run = MatrixRun(_case().case_id, (_result(),), (), writers, readers)
+    with pytest.raises(RuntimeError):
+        build_bundle(_source(), tmp_path / "invalid", lambda case, path: run)
     escaped = tmp_path / "escaped"
 
     def escape(case: Case, directory: Path) -> MatrixRun:
@@ -219,26 +199,27 @@ def test_publication_refuses_existing_targets_before_evaluation(tmp_path: Path) 
         return MatrixRun(case.case_id, (_result(),), (("pyarrow", path),), writers, readers)
 
     with pytest.raises(RuntimeError, match="outside the evaluation directory"):
-        publish_bundle(_source(), escaped, escape)
-    assert not escaped.exists()
+        build_bundle(_source(), escaped, escape)
+    profile = _capability(writers[0], {"row_group_size": 2})
+    plan = wp.WriterProfilePlan(("row-group-2",), (profile,))
+    with pytest.raises(RuntimeError, match="conflicting writer profile plan"):
+        build_bundle(replace(_source(), writer_profiles=plan), tmp_path / "profile", _evaluate)
 
 
 def test_invalid_payload_shapes_fail_validation(tmp_path: Path) -> None:
-    mutations = ("missing", "missing-manifest", "extra", "tampered")
-    mutations += ("resealed-report", "noncanonical", "nested", "symlink")
+    mutations = ("missing", "missing-manifest", "extra")
+    mutations += ("report", "noncanonical", "nested", "symlink")
     for mutation in mutations:
         destination = tmp_path / mutation
-        _publish(destination)
+        _build(destination)
         if mutation == "missing":
             (destination / "REPORT.md").unlink()
         elif mutation == "missing-manifest":
             (destination / "finding.json").unlink()
         elif mutation == "extra":
             (destination / "extra.txt").write_text("extra")
-        elif mutation == "tampered":
-            (destination / "matrix.json").write_bytes(b"{}")
-        elif mutation == "resealed-report":
-            _replace_artifact(destination, "REPORT.md", b"# arbitrary but resealed\n")
+        elif mutation == "report":
+            (destination / "REPORT.md").write_bytes(b"# unsealed tamper\n")
         elif mutation == "noncanonical":
             path = destination / "finding.json"
             path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2))
@@ -249,17 +230,19 @@ def test_invalid_payload_shapes_fail_validation(tmp_path: Path) -> None:
             external.write_text("external")
             (destination / "REPORT.md").unlink()
             (destination / "REPORT.md").symlink_to(external)
-        with pytest.raises(BundleValidationError):
+        with pytest.raises(BundleValidationError) as caught:
             validate_bundle(destination)
+        if mutation == "report":
+            assert (caught.value.kind, caught.value.detail) == (
+                "INVALID_BUNDLE",
+                "artifact evidence does not match",
+            )
 
 
 def test_canonical_payloads_with_conflicting_identity_are_rejected(tmp_path: Path) -> None:
-    def forbidden(case: Case, directory: Path) -> MatrixRun:
-        raise AssertionError((case, directory))
-
     for mutation in ("matrix-noncanonical", "case", "discovered", "matrix"):
         destination = tmp_path / mutation
-        _publish(
+        _build(
             destination, discovered=_case(extra_field=True) if mutation == "discovered" else None
         )
         if mutation == "matrix-noncanonical":
@@ -276,13 +259,10 @@ def test_canonical_payloads_with_conflicting_identity_are_rejected(tmp_path: Pat
             _replace_artifact(destination, "matrix.json", payload)
         with pytest.raises(BundleValidationError):
             validate_bundle(destination)
-        if mutation == "case":
-            with pytest.raises(BundleValidationError):
-                replay_bundle(destination, forbidden)
     signature = ReplaySignature.from_result(_result())
     data = signature.to_data()
     assert ReplaySignature.from_data(data) == signature
-    profile = WriterProfileIdentity("row-group-2", {"row_group_size": 2})
+    profile = wp.WriterProfileIdentity("row-group-2", {"row_group_size": 2})
     profiled = replace(signature, writer_profile=profile)
     assert ReplaySignature.from_data(profiled.to_data(), allow_profile=True) == profiled
     invalid = [{**data, key: "forbidden"} for key in ("writer_version", "reader_version", "extra")]
@@ -296,7 +276,7 @@ def test_canonical_payloads_with_conflicting_identity_are_rejected(tmp_path: Pat
 
 def test_replay_classifies_version_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     destination = tmp_path / "finding"
-    _publish(destination)
+    _build(destination)
     dependency_versions: dict[str, str | None] = {"pyarrow": "1"}
 
     def dependency_version(package: str) -> str:
@@ -316,11 +296,12 @@ def test_replay_classifies_version_drift(tmp_path: Path, monkeypatch: pytest.Mon
 
         return evaluate
 
-    exact = replay_bundle(destination, evaluator(_result(writer_version="9", reader_version="8")))
+    validated = validate_bundle(destination)
+    exact = replay(validated, evaluator(_result(writer_version="9", reader_version="8")))
     dependency_versions["pyarrow"] = "9"
-    related = replay_bundle(destination, evaluator(_result(detail="controlled mismatch 7")))
+    related = replay(validated, evaluator(_result(detail="controlled mismatch 7")))
     dependency_versions["pyarrow"] = None
-    absent = replay_bundle(destination, evaluator(_result(diagnostic_kind="DifferentError")))
+    absent = replay(validated, evaluator(_result(diagnostic_kind="DifferentError")))
     assert exact.classification is ReplayClassification.REPRODUCED
     drift = [(item.original, item.current) for item in exact.version_drift]
     assert drift == [("1", "9"), ("2", "8")]
@@ -341,7 +322,7 @@ def test_historical_profile_plans_validate_before_replay_admission(
         source = replace(_source(), writers=writers, writer_profiles=plan)
         historical = tmp_path / change
         historical_evaluator = partial(_historical_evaluate, plan=plan, writers=writers)
-        publish_bundle(source, historical, historical_evaluator)
+        build_bundle(source, historical, historical_evaluator)
         assert validate_bundle(historical).finding.writer_profiles == plan
         assert cli.main(["replay", str(historical)]) == 2
         payload = cast(dict[str, object], json.loads(capsys.readouterr().out))

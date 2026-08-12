@@ -13,25 +13,30 @@ import pytest
 
 from parquity import cli
 from parquity.engines import EngineSelection, resolve_engine_selection
-from parquity.engines.base import EngineIdentity, EngineWriter, ProviderOperationError
+from parquity.engines.base import (
+    EngineIdentity,
+    EngineReader,
+    EngineWriter,
+    ProviderOperationError,
+)
 from parquity.engines.pyarrow import PyArrowEngine
 from parquity.findings.bundle import ValidatedBundle
 from parquity.findings.replay import replay_validated_bundle
 from parquity.matrix import run_matrix
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.runs.bundle import ValidatedRun
-from parquity.runs.replay import replay_validated_run
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
-from parquity.writer_profile_contracts import admit_writer_profile_plan
-from parquity.writer_profiles import (
+from parquity.profiles import (
     PROFILE_REGISTRY,
     CapabilityStatus,
     WriterExecutionIdentity,
     WriterProfileError,
     WriterProfileIdentity,
     WriterProfilePlan,
-    build_writer_profile_plan,
 )
+from parquity.profiles.contracts import admit_writer_profile_plan
+from parquity.profiles.selection import build_writer_profile_plan
+from parquity.runs.bundle import ValidatedRun
+from parquity.runs.replay import replay_validated_run
+from parquity.verdicts import CellResult, MatrixRun, Verdict
 
 
 def _fixed_case() -> Case:
@@ -212,13 +217,14 @@ def test_profile_plan_is_admitted_once_per_command_and_reused_within_fuzz(
     def evaluate(
         case: Case,
         directory: Path,
-        selection: EngineSelection,
+        writer_set: Sequence[EngineWriter],
+        reader_set: Sequence[EngineReader],
         writer_profiles: WriterProfilePlan | None = None,
     ) -> MatrixRun:
         del directory
         observed.append(writer_profiles)
-        writers = tuple(EngineVersion(*item) for item in selection.writer_versions)
-        readers = tuple(EngineVersion(*item) for item in selection.reader_versions)
+        writers = tuple(item.identity for item in writer_set)
+        readers = tuple(item.identity for item in reader_set)
         executions = (
             tuple(WriterExecutionIdentity(writer) for writer in writers)
             if writer_profiles is None
@@ -242,9 +248,7 @@ def test_profile_plan_is_admitted_once_per_command_and_reused_within_fuzz(
         return MatrixRun(case.case_id, results, (), writers, readers, writer_profiles)
 
     monkeypatch.setattr(generated, "admit_writer_profile_plan", counted_admission)
-    monkeypatch.setattr(
-        import_module("parquity.generation.workflow"), "evaluate_selected_case", evaluate
-    )
+    monkeypatch.setattr(import_module("parquity.generation.workflow"), "run_matrix", evaluate)
     profile_args = ["--writers", "pyarrow", "--readers", "pyarrow"]
     profile_args += ["--writer-profiles", "compression-gzip"]
     assert (

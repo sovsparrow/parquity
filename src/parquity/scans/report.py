@@ -1,339 +1,579 @@
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Mapping
-from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
 
-from ..findings import json_codec as codec
-from ..reporting import human_location, markdown_literal
-from ..triage.adapters import scan_child_occurrences
-from ..triage.model import Family, group_occurrences
-from ..triage.normalization import detail_sha256_v1
-from ..verdicts import EngineVersion
-from . import records, symptoms
+from ..evidence import EngineVersion, EnvironmentEvidence, ReplayClassification
+from ..evidence import json_codec as codec
+from ..evidence.normalization import detail_sha256_v1
+from ..reporting import (
+    MAX_LOCATION_CHARS,
+    MAX_SUMMARY_CHARS,
+    ArtifactRef,
+    DetailView,
+    EvidenceKind,
+    EvidenceReportView,
+    FindingEvidenceView,
+    FindingView,
+    InputView,
+    ReplayState,
+    ReplayStateCount,
+    ReportValidationError,
+    RunReportView,
+    TableView,
+    bounded_text,
+    environment_details,
+)
+from . import records, summary, symptoms
+from .differences import ScanDifference
+from .scripts import reproduction_steps
 
 if TYPE_CHECKING:
-    from .bundle import ValidatedScanFinding
+    from .bundle import ValidatedScanFinding, ValidatedScanRun
+    from .workflow import ScanExecution
 
 
-def render_reproduce() -> bytes:
-    return _template("reproduce").encode()
+@dataclass(frozen=True, slots=True)
+class _OccurrenceMember:
+    reference: symptoms.ScanOccurrenceRef
+    source_path: str
+    record: records.ScanFindingRecord
+    occurrence: symptoms.ScanSymptom
 
 
-def render_upstream_repro(engines: tuple[EngineVersion, ...]) -> bytes:
-    return (
-        _template("upstream_repro")
-        .replace("__ENGINES__", repr(tuple(item.name for item in engines)))
-        .encode()
+@dataclass(frozen=True, slots=True)
+class _FindingGroup:
+    key: symptoms.ScanFindingKey
+    members: tuple[_OccurrenceMember, ...]
+
+
+class _ReplayResult(Protocol):
+    @property
+    def finding_id(self) -> str: ...
+
+    @property
+    def occurrence_results(self) -> tuple[Mapping[str, object], ...]: ...
+
+    @property
+    def new_observations(self) -> tuple[Mapping[str, object], ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ScanReportOverlay:
+    states: tuple[tuple[symptoms.ScanOccurrenceRef, ReplayClassification], ...]
+    new_observations: tuple[DetailView, ...]
+
+    def __post_init__(self) -> None:
+        references = tuple(item[0] for item in self.states)
+        if references != tuple(sorted(references)) or len(references) != len(set(references)):
+            raise ReportValidationError("scan replay overlay targets must be unique and ordered")
+
+
+def build_replay_overlay(results: Iterable[_ReplayResult]) -> ScanReportOverlay:
+    states: list[tuple[symptoms.ScanOccurrenceRef, ReplayClassification]] = []
+    observations: list[DetailView] = []
+    for result in results:
+        for item in result.occurrence_results:
+            reference = symptoms.ScanOccurrenceRef(
+                result.finding_id,
+                records.text(item, "occurrence_id"),
+            )
+            try:
+                state = ReplayClassification(records.text(item, "classification"))
+            except ValueError as error:
+                raise ReportValidationError("scan replay classification is invalid") from error
+            states.append((reference, state))
+        observations.extend(
+            _new_replay_observation(result.finding_id, item) for item in result.new_observations
+        )
+    return ScanReportOverlay(
+        tuple(sorted(states, key=lambda item: item[0])),
+        tuple(sorted(observations, key=lambda item: item.label)),
     )
 
 
-def render_finding_report(record: records.ScanFindingRecord) -> bytes:
-    outcomes = records.mappings(record.data["outcomes"], "outcomes")
-    groups = records.mappings(record.data["observation_groups"], "groups")
-    comparisons = records.mappings(record.data["comparisons"], "comparisons")
-    occurrences = symptoms.extract(record, detail_sha256_v1)
-    group_index = dict(records.group_members(group) for group in groups)
-    lines = [
-        "## Summary",
-        "",
-        _finding_summary(record.source_path, outcomes, comparisons),
-        "",
-        "Parquity compared independent reader observations.",
-        "No reader is treated as the reference answer, and this evidence does not assign",
-        "provider fault.",
-        "",
-        "## Source file",
-        "",
-        f"- Original path: {markdown_literal(record.source_path)}",
-        f"- Size: `{record.input_bytes}` bytes",
-        f"- SHA-256: `{record.input_sha256}`",
-        "- Retained input: [`input.parquet`](input.parquet)",
-        "",
-        "## Reader outcomes",
-        "",
-        *_outcome_table(outcomes, group_index),
-        "",
-        *_comparison_section(comparisons, group_index),
-        "",
-        "## Reproduce",
-        "",
-        "Run `python reproduce.py` in this directory to validate the bundle and repeat the",
-        "full reader comparison.",
-        "",
-        *(
-            f"- `python upstream_repro.py {engine.name}` runs the direct `{engine.name}` reader."
-            for engine in record.engines
-        ),
-        "",
-        "Inspect both scripts before running them. Direct scripts emit provider evidence and",
-        "do not apply Parquity's semantic comparison.",
-        "",
-        "## What this evidence establishes",
-        "",
-        "- Established: the recorded readers produced these outcomes for these exact bytes in",
-        "  the recorded environment.",
-        "- Not established: which observation is correct, root cause, provider fault, or",
-        "  behavior on untested versions.",
-        "",
-        "## Occurrence index",
-        "",
-        *_occurrence_table(occurrences),
-        "",
-        "## Technical evidence",
-        "",
-        f"- Finding identity: `{record.finding_id}`",
-        f"- Signature SHA-256: `{record.signature_sha256}`",
-        f"- Timeout per reader: `{record.timeout_seconds}` seconds",
-        f"- Occurrences extracted: `{len(occurrences)}`",
-        "- Canonical manifest: [`finding.json`](finding.json)",
-        "",
-        "This bundle contains source bytes and diagnostics that may reveal sensitive data.",
-        "Inspect every file before sharing it.",
-    ]
-    return _template("finding_report").format(body="\n".join(lines)).encode()
-
-
-def render_run_report(
-    record: records.ScanRunRecord,
-    children: tuple[ValidatedScanFinding, ...],
-) -> bytes:
-    data = record.data
+def build_run_report_view(
+    validated: ValidatedScanRun,
+    replay: ScanReportOverlay | None = None,
+    *,
+    command_line: str | None = None,
+) -> RunReportView:
+    groups, references = _partition(validated)
+    states = None if replay is None else dict(replay.states)
+    if states is not None and frozenset(states) != references:
+        raise ReportValidationError("complete scan replay must classify every occurrence")
+    ordered = tuple(sorted(groups, key=_finding_order))
+    findings = tuple(
+        _finding_view(index, group, states) for index, group in enumerate(ordered, start=1)
+    )
+    data = validated.record.data
     discovery = codec.mapping(data["discovery"], "discovery")
     files = records.mappings(discovery["files"], "files")
-    overflow = tuple(
+    overflow = _overflow(data)
+    engines = records.engine_versions(data["engines"])
+    evaluated = len(files) - len(overflow)
+    affected = {member.reference.source_bundle_id for group in groups for member in group.members}
+    return RunReportView(
+        command="scan",
+        evidence_kind=EvidenceKind.SCAN,
+        summary=summary.run_summary(
+            tuple(child.record for child in validated.children),
+            evaluated,
+            len(findings),
+            len(overflow),
+        ),
+        writers=(),
+        readers=_provider_labels(engines),
+        evaluated_input_count=evaluated,
+        executed_check_count=evaluated * len(engines),
+        affected_input_count=len(affected),
+        findings=findings,
+        saved_evidence_count=len(findings),
+        evidence_bundle_count=len(validated.children),
+        unevaluated_input_count=len(overflow),
+        stop=_stop(data),
+        bounds=_bounds(data, discovery),
+        environment=_scan_environment(validated.record),
+        machine_record=ArtifactRef("scan.json", "scan.json"),
+        replay_observations=() if replay is None else replay.new_observations,
+        command_line=command_line,
+    )
+
+
+def build_clean_run_report_view(
+    execution: ScanExecution,
+    *,
+    timeout_seconds: int,
+    max_saved: int,
+    command_line: str | None = None,
+) -> RunReportView:
+    discovery = execution.discovery
+    engines = execution.environment.providers
+    if execution.run is not None or execution.evaluated_files != len(discovery.files):
+        raise ReportValidationError("clean scan evidence is incomplete or contains a run")
+    return RunReportView(
+        command="scan",
+        evidence_kind=EvidenceKind.SCAN,
+        summary=summary.clean_summary(execution.evaluated_files, len(engines)),
+        writers=(),
+        readers=_provider_labels(engines),
+        evaluated_input_count=execution.evaluated_files,
+        executed_check_count=execution.evaluated_files * len(engines),
+        affected_input_count=0,
+        findings=(),
+        saved_evidence_count=0,
+        evidence_bundle_count=0,
+        unevaluated_input_count=0,
+        stop="All discovered Inputs evaluated",
+        bounds=(
+            DetailView("Source", discovery.input_kind),
+            DetailView("Reproducer limit", str(max_saved)),
+            DetailView("Timeout per reader", f"{timeout_seconds} seconds"),
+            DetailView("Symlinks skipped", str(discovery.skipped_symlinks)),
+            DetailView("Filesystem entries visited", str(discovery.visited_entries)),
+        ),
+        environment=_environment_details(execution.environment),
+        machine_record=None,
+        command_line=command_line,
+    )
+
+
+def build_evidence_report_view(
+    record: records.ScanFindingRecord,
+    replay: ScanReportOverlay | None = None,
+) -> EvidenceReportView:
+    occurrences = tuple(
+        sorted(
+            symptoms.extract(record, detail_sha256_v1),
+            key=lambda item: _display_order(symptoms.finding_key(item), item.occurrence_id),
+        )
+    )
+    if not occurrences:
+        raise ReportValidationError("scan source evidence has no Occurrences")
+    replay_states = None if replay is None else dict(replay.states)
+    states = _standalone_states(record, occurrences, replay_states)
+    return EvidenceReportView(
+        evidence_kind=EvidenceKind.SCAN,
+        title="Parquity scan evidence",
+        summary=summary.file_summary(record, saved=False),
+        facts=_report_facts(record),
+        reproduce=reproduction_steps(record),
+        input=InputView(
+            identity=record.input_sha256,
+            facts=(
+                DetailView("Path", record.source_path),
+                DetailView("Bytes", str(record.input_bytes)),
+            ),
+            artifacts=(ArtifactRef("retained Parquet bytes", "input.parquet"),),
+        ),
+        finding_evidence=tuple(
+            _occurrence_evidence(record, occurrence, states[occurrence.occurrence_id])
+            for occurrence in occurrences
+        ),
+        outcomes=_outcomes(record),
+        environment=(
+            *_scan_environment(record),
+            DetailView(
+                "Readers",
+                ", ".join(sorted(f"{item.name} {item.version}" for item in record.engines)),
+            ),
+            DetailView("Timeout per reader", f"{record.timeout_seconds} seconds"),
+        ),
+        machine_record=ArtifactRef("finding.json", "finding.json"),
+        replay_observations=() if replay is None else replay.new_observations,
+    )
+
+
+def build_standalone_report_view(
+    validated: ValidatedScanFinding,
+    replay: ScanReportOverlay | None = None,
+) -> EvidenceReportView:
+    return build_evidence_report_view(validated.record, replay)
+
+
+def _partition(
+    validated: ValidatedScanRun,
+) -> tuple[tuple[_FindingGroup, ...], frozenset[symptoms.ScanOccurrenceRef]]:
+    grouped: defaultdict[symptoms.ScanFindingKey, list[_OccurrenceMember]] = defaultdict(list)
+    all_references: list[symptoms.ScanOccurrenceRef] = []
+    for child in validated.children:
+        source_bundle_id = child.record.finding_id
+        for occurrence in symptoms.extract(child.record, detail_sha256_v1):
+            reference = symptoms.ScanOccurrenceRef(source_bundle_id, occurrence.occurrence_id)
+            all_references.append(reference)
+            grouped[symptoms.finding_key(occurrence)].append(
+                _OccurrenceMember(
+                    reference,
+                    child.record.source_path,
+                    child.record,
+                    occurrence,
+                )
+            )
+    expected = frozenset(all_references)
+    if len(expected) != len(all_references):
+        raise ReportValidationError("scan occurrence references are not unique")
+    groups = tuple(
+        _FindingGroup(key, tuple(sorted(members, key=lambda item: item.reference)))
+        for key, members in grouped.items()
+    )
+    _validate_partition(groups, expected)
+    return groups, expected
+
+
+def _validate_partition(
+    groups: tuple[_FindingGroup, ...],
+    expected: frozenset[symptoms.ScanOccurrenceRef],
+) -> None:
+    observed: set[symptoms.ScanOccurrenceRef] = set()
+    for group in groups:
+        references = {member.reference for member in group.members}
+        if not references:
+            raise ReportValidationError("scan Finding group must not be empty")
+        if observed & references:
+            raise ReportValidationError("scan Finding groups overlap")
+        if any(symptoms.finding_key(member.occurrence) != group.key for member in group.members):
+            raise ReportValidationError("scan Finding group conflicts with its key")
+        observed.update(references)
+    if frozenset(observed) != expected:
+        raise ReportValidationError("scan Finding groups do not conserve Occurrences")
+
+
+def _finding_order(group: _FindingGroup) -> tuple[object, ...]:
+    return _display_order(group.key, min(member.reference for member in group.members))
+
+
+def _display_order(key: symptoms.ScanFindingKey, tie_breaker: object) -> tuple[object, ...]:
+    return (
+        _participant_groups(key),
+        key.operation,
+        key.signal,
+        _outcome_kind(key),
+        key.normalized_location or "",
+        key.canonical_bytes(),
+        tie_breaker,
+    )
+
+
+def _finding_view(
+    index: int,
+    group: _FindingGroup,
+    replay: Mapping[symptoms.ScanOccurrenceRef, ReplayClassification] | None,
+) -> FindingView:
+    representative = group.members[0]
+    occurrence = representative.occurrence
+    exact_location = _exact_location(representative.record, occurrence)
+    return FindingView(
+        label=f"F{index}",
+        participants=bounded_text(_participants(group.key), MAX_SUMMARY_CHARS),
+        stage="read" if group.key.target_reader is not None else "compare",
+        outcome_kind=bounded_text(_outcome_kind(group.key), MAX_SUMMARY_CHARS),
+        summary=bounded_text(_summary(occurrence), MAX_SUMMARY_CHARS),
+        evidence_input=bounded_text(representative.source_path, MAX_SUMMARY_CHARS),
+        exact_location=bounded_text(exact_location, MAX_LOCATION_CHARS),
+        occurrence_count=len(group.members),
+        distinct_input_count=len({member.reference.source_bundle_id for member in group.members}),
+        saved_replay_target_count=len(group.members),
+        evidence_refs=tuple(
+            ArtifactRef(
+                bounded_text(member.source_path, MAX_SUMMARY_CHARS),
+                f"findings/{member.reference.source_bundle_id}/REPORT.md",
+                f"occurrence-{member.reference.occurrence_id}",
+            )
+            for member in group.members
+        ),
+        replay_state_counts=_replay_counts(group.members, replay),
+    )
+
+
+def _replay_counts(
+    members: tuple[_OccurrenceMember, ...],
+    replay: Mapping[symptoms.ScanOccurrenceRef, ReplayClassification] | None,
+) -> tuple[ReplayStateCount, ...]:
+    counts: Counter[ReplayState] = Counter()
+    for member in members:
+        state = ReplayState.NOT_RUN
+        if replay is not None and member.reference in replay:
+            state = ReplayState(replay[member.reference].value)
+        counts[state] += 1
+    return tuple(ReplayStateCount(state, counts[state]) for state in ReplayState if counts[state])
+
+
+def _occurrence_evidence(
+    record: records.ScanFindingRecord,
+    occurrence: symptoms.ScanSymptom,
+    replay_state: ReplayState,
+) -> FindingEvidenceView:
+    key = symptoms.finding_key(occurrence)
+    facts = [
+        DetailView("Location", _exact_location(record, occurrence)),
+    ]
+    if replay_state is not ReplayState.NOT_RUN:
+        facts.append(DetailView("Last replay", replay_state.display_label))
+    if key.target_reader is not None:
+        evidence = key.evidence[0]
+        if not isinstance(evidence, symptoms.ScanExecutionEvidence):
+            raise ReportValidationError("scan reader failure evidence is malformed")
+        facts.extend(
+            (
+                DetailView("Observation", "No table was returned"),
+                DetailView("Diagnostic kind", evidence.diagnostic_kind),
+                DetailView("Captured detail", occurrence.details[0] or "No detail was captured"),
+            )
+        )
+        outcome = _reader_outcome(record, key.target_reader)
+        if outcome.stderr:
+            suffix = " [capture truncated]" if outcome.stderr_truncated else ""
+            facts.append(DetailView("Captured stderr", outcome.stderr + suffix))
+        if evidence.timeout_seconds is not None:
+            facts.append(DetailView("Timeout", f"{evidence.timeout_seconds} seconds"))
+        summary = f"{key.target_reader} · read · {_outcome_kind(key)}"
+    else:
+        for edge_index, (evidence, detail) in enumerate(
+            zip(key.evidence, occurrence.details, strict=True), start=1
+        ):
+            if not isinstance(evidence, symptoms.ScanComparisonEdge):
+                raise ReportValidationError("scan comparison evidence is malformed")
+            suffix = f" {edge_index}" if len(key.evidence) > 1 else ""
+            facts.extend(
+                (
+                    DetailView(
+                        f"Comparison{suffix}",
+                        f"{_group_label(evidence.groups[0])} / "
+                        f"{_group_label(evidence.groups[1])} · {evidence.comparison_kind}",
+                    ),
+                    DetailView(
+                        f"Captured detail{suffix}",
+                        detail or "No detail was captured",
+                    ),
+                )
+            )
+        summary = f"{_participants(key)} · compare · {occurrence.signal}"
+    return FindingEvidenceView(
+        anchor=f"occurrence-{occurrence.occurrence_id}",
+        summary=summary,
+        facts=tuple(facts),
+    )
+
+
+def _standalone_states(
+    record: records.ScanFindingRecord,
+    occurrences: tuple[symptoms.ScanSymptom, ...],
+    replay: Mapping[symptoms.ScanOccurrenceRef, ReplayClassification] | None,
+) -> dict[str, ReplayState]:
+    references = {
+        symptoms.ScanOccurrenceRef(record.finding_id, occurrence.occurrence_id)
+        for occurrence in occurrences
+    }
+    if replay is not None and not set(replay) <= references:
+        raise ReportValidationError("standalone scan replay contains an unknown occurrence")
+    result: dict[str, ReplayState] = {}
+    for reference in sorted(references):
+        state = ReplayState.NOT_RUN
+        if replay is not None and reference in replay:
+            state = ReplayState(replay[reference].value)
+        result[reference.occurrence_id] = state
+    return result
+
+
+def _report_facts(record: records.ScanFindingRecord) -> tuple[DetailView, ...]:
+    successful = tuple(
+        outcome for outcome in record.outcomes if outcome.kind is records.ReaderOutcomeKind.SUCCESS
+    )
+    groups = {outcome.observation_group for outcome in successful}
+    if len(groups) > 1:
+        return (DetailView("Reference result", "None; readers are compared symmetrically"),)
+    return ()
+
+
+def _new_replay_observation(
+    source_bundle_id: str,
+    value: Mapping[str, object],
+) -> DetailView:
+    occurrence_id = records.text(value, "occurrence_id")
+    signal = records.text(value, "signal")
+    target = value.get("target_reader")
+    location = value.get("normalized_location")
+    context = (
+        target if isinstance(target, str) else location if isinstance(location, str) else "root"
+    )
+    return DetailView(
+        f"{source_bundle_id} / {occurrence_id}",
+        bounded_text(f"{signal} · {context}", MAX_SUMMARY_CHARS),
+    )
+
+
+def _outcomes(record: records.ScanFindingRecord) -> TableView:
+    return TableView(
+        ("Reader", "Version", "Result", "Rows", "Columns", "Observation / diagnostic"),
+        tuple(
+            (
+                outcome.engine,
+                outcome.version,
+                outcome.kind.value,
+                str(outcome.row_count) if outcome.row_count is not None else "—",
+                str(outcome.column_count) if outcome.column_count is not None else "—",
+                (
+                    f"group {outcome.observation_group}"
+                    if outcome.kind is records.ReaderOutcomeKind.SUCCESS
+                    else outcome.diagnostic_kind
+                ),
+            )
+            for outcome in sorted(record.outcomes, key=lambda item: (item.engine, item.version))
+        ),
+    )
+
+
+def _reader_outcome(
+    record: records.ScanFindingRecord,
+    reader: str,
+) -> records.ReaderOutcomeRecord:
+    matches = tuple(item for item in record.outcomes if item.engine == reader)
+    if len(matches) != 1:
+        raise ReportValidationError("scan reader occurrence has no unique outcome")
+    return matches[0]
+
+
+def _participants(key: symptoms.ScanFindingKey) -> str:
+    if key.target_reader is not None:
+        return key.target_reader
+    return " ↔ ".join(_group_label(group) for group in _participant_groups(key))
+
+
+def _participant_groups(key: symptoms.ScanFindingKey) -> tuple[tuple[str, ...], ...]:
+    if key.target_reader is not None:
+        return ((key.target_reader,),)
+    groups: set[tuple[str, ...]] = set()
+    for evidence in key.evidence:
+        if not isinstance(evidence, symptoms.ScanComparisonEdge):
+            raise ReportValidationError("scan comparison key is malformed")
+        groups.update(evidence.groups)
+    return tuple(sorted(groups))
+
+
+def _group_label(group: tuple[str, ...]) -> str:
+    return ", ".join(group)
+
+
+def _outcome_kind(key: symptoms.ScanFindingKey) -> str:
+    if key.target_reader is None:
+        return key.signal
+    evidence = key.evidence[0]
+    if not isinstance(evidence, symptoms.ScanExecutionEvidence):
+        raise ReportValidationError("scan execution key is malformed")
+    return (
+        key.signal
+        if evidence.diagnostic_kind == key.signal
+        else f"{key.signal} · {evidence.diagnostic_kind}"
+    )
+
+
+def _summary(occurrence: symptoms.ScanSymptom) -> str:
+    details = " · ".join(value for value in occurrence.details if value.strip())
+    return details or occurrence.signal
+
+
+def _exact_location(record: records.ScanFindingRecord, occurrence: symptoms.ScanSymptom) -> str:
+    if occurrence.normalized_location is None:
+        return "whole file"
+    locations: set[str] = set()
+    for item in records.mappings(record.data["comparisons"], "comparisons"):
+        difference = ScanDifference.from_persisted(
+            records.text(item, "kind"), records.text(item, "path")
+        )
+        normalized = difference.normalized()
+        if (
+            normalized.kind.value == occurrence.signal
+            and normalized.path == occurrence.normalized_location
+        ):
+            locations.add(difference.path)
+    if not locations:
+        raise ReportValidationError("scan occurrence location has no source evidence")
+    return " / ".join(sorted(locations))
+
+
+def _bounds(data: Mapping[str, object], discovery: Mapping[str, object]) -> tuple[DetailView, ...]:
+    values = [
+        DetailView(
+            "Reproducer limit",
+            str(records.saved_limit(data)),
+        ),
+        DetailView(
+            "Timeout per reader",
+            f"{codec.integer(data['timeout_seconds'], 'timeout')} seconds",
+        ),
+    ]
+    skipped = codec.integer(discovery["skipped_symlinks"], "skipped symlinks")
+    if skipped:
+        values.append(DetailView("Symlinks skipped", str(skipped)))
+    return tuple(values)
+
+
+def _overflow(data: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(
         codec.string(item, "overflow path") for item in codec.sequence(data["overflow"], "overflow")
     )
-    engines = records.engine_versions(data["engines"])
-    child_by_id = {child.record.finding_id: child for child in children}
-    indexes = records.mappings(data["findings"], "findings")
-    occurrences = scan_child_occurrences(children)
-    families = group_occurrences(occurrences)
-    lines = [
-        "## Summary",
-        "",
-        _run_summary(records.text(data, "status"), len(indexes), len(overflow)),
-        "",
-        "A scan finding is one source file with at least one reader failure or disagreement.",
-        "It is not a count of upstream defects.",
-        "",
-        "## Run scope",
-        "",
-        *_scan_scope(data, discovery, files, indexes, overflow),
-        "",
-        "## Files with observed problems",
-        "",
-        *_finding_index(indexes, child_by_id),
-    ]
-    if overflow:
-        lines.extend(("", *_unevaluated_files(overflow)))
-    lines.extend(
-        (
-            "",
-            *_family_section(families),
-            "",
-            "## Replay and triage",
-            "",
-            "- `parquity replay .` validates and replays every retained file finding.",
-            "- `parquity replay --json . > replay.json` writes canonical replay evidence.",
-            "- `parquity triage .` groups repeated symptom shapes across files.",
-            "",
-            "## Coverage and limits",
-            "",
-            "- Results cover only discovered files that were evaluated before the finding cap.",
-            "- Symlinks are skipped; discovery and retained-byte limits remain bounded.",
-            "- Reader agreement does not prove that an observation is specification-correct.",
-            "",
-            "## Environment and exact evidence",
-            "",
-            f"- Parquity: `{records.text(data, 'parquity_version')}`",
-            f"- Readers: `{_engines(engines)}`",
-            f"- Timeout per reader: `{codec.integer(data['timeout_seconds'], 'timeout')}` seconds",
-            "- Canonical manifest: [`scan.json`](scan.json)",
-            "",
-            "Each finding contains source bytes and diagnostics that may reveal sensitive data.",
-            "Inspect every child before sharing it.",
-        )
-    )
-    return _template("run_report").format(body="\n".join(lines)).encode()
 
 
-def _finding_summary(
-    source: str,
-    outcomes: tuple[Mapping[str, object], ...],
-    comparisons: tuple[Mapping[str, object], ...],
-) -> str:
-    failures = sum(records.text(item, "kind") != "SUCCESS" for item in outcomes)
-    return (
-        f"For {markdown_literal(source)}, **{failures}** readers failed and "
-        f"**{len(comparisons)}** pairwise observation differences were recorded."
-    )
+def _stop(data: Mapping[str, object]) -> str:
+    status = records.status_from_data(records.text(data, "status"), records.text(data, "format"))
+    if status is records.ScanRunStatus.SAVED_EVIDENCE_LIMIT_REACHED:
+        return "Saved-evidence limit reached"
+    return "All discovered Inputs evaluated"
 
 
-def _outcome_table(
-    outcomes: tuple[Mapping[str, object], ...],
-    groups: dict[str, tuple[str, ...]],
-) -> tuple[str, ...]:
-    lines = [
-        "| Reader | Outcome | Shape | Observation group | Diagnostic |",
-        "|---|---|---|---|---|",
-    ]
-    for item in outcomes:
-        engine = f"{records.text(item, 'engine')} {records.text(item, 'version')}"
-        kind = records.text(item, "kind")
-        group = cast(str | None, item["observation_group"])
-        if kind == "SUCCESS":
-            shape = f"{item['row_count']} rows by {item['column_count']} columns"
-            diagnostic = "—"
-        else:
-            shape = "no table returned"
-            detail = records.text(item, "detail")
-            rendered_detail = (
-                markdown_literal(detail) if detail else "No diagnostic text was captured."
-            )
-            diagnostic = f"{markdown_literal(records.text(item, 'diagnostic_kind'))}: "
-            diagnostic += rendered_detail
-        member_group = "—" if group is None else f"`{group}` ({', '.join(groups[group])})"
-        lines.append(f"| `{engine}` | `{kind}` | {shape} | {member_group} | {diagnostic} |")
-    return tuple(lines)
+def _provider_labels(engines: tuple[EngineVersion, ...]) -> tuple[str, ...]:
+    return tuple(sorted(f"{item.name} {item.version}" for item in engines))
 
 
-def _comparison_section(
-    comparisons: tuple[Mapping[str, object], ...],
-    groups: dict[str, tuple[str, ...]],
-) -> tuple[str, ...]:
-    lines = [
-        "## Observed differences",
-        "",
-        "The left and right columns name reader groups, not expected and observed truth.",
-        "",
-    ]
-    if not comparisons:
-        lines.append(
-            "No pairwise semantic difference was recorded; the finding comes from a reader failure."
-        )
-        return tuple(lines)
-    lines.extend(
-        (
-            "| Kind | Readers A | Readers B | Where | Detail |",
-            "|---|---|---|---|---|",
-        )
-    )
-    for item in comparisons:
-        left = ", ".join(groups[records.text(item, "left_group")])
-        right = ", ".join(groups[records.text(item, "right_group")])
-        lines.append(
-            f"| `{records.text(item, 'kind')}` | `{left}` | `{right}` | "
-            f"{human_location(records.text(item, 'path'))} | "
-            f"{markdown_literal(records.text(item, 'detail'))} |"
-        )
-    return tuple(lines)
+def _scan_environment(
+    record: records.ScanRunRecord | records.ScanFindingRecord,
+) -> tuple[DetailView, ...]:
+    if record.environment is None:
+        return (DetailView("Parquity", record.parquity_version),)
+    return _environment_details(record.environment)
 
 
-def _occurrence_table(values: tuple[symptoms.ScanSymptom, ...]) -> tuple[str, ...]:
-    lines = [
-        "| Signal | Reader | Location | Occurrence identity |",
-        "|---|---|---|---|",
-    ]
-    for item in values:
-        reader = "reader groups" if item.target_reader is None else item.target_reader
-        location = (
-            "no table returned"
-            if item.normalized_location is None
-            else human_location(str(item.normalized_location))
-        )
-        lines.append(f"| `{item.signal}` | `{reader}` | {location} | `{item.occurrence_id}` |")
-    return tuple(lines)
-
-
-def _run_summary(status: str, finding_count: int, overflow_count: int) -> str:
-    summary = f"Parquity retained **{finding_count}** file findings."
-    if overflow_count:
-        summary += f" **{overflow_count}** later files were not evaluated after the finding cap."
-        summary += " This run is incomplete and not exhaustive."
-    return f"{summary} Run status: `{status}`."
-
-
-def _scan_scope(
-    data: Mapping[str, object],
-    discovery: Mapping[str, object],
-    files: tuple[Mapping[str, object], ...],
-    findings: tuple[Mapping[str, object], ...],
-    overflow: tuple[str, ...],
-) -> tuple[str, ...]:
-    return (
-        "| Measure | Value |",
-        "|---|---:|",
-        f"| Parquet files discovered | {len(files)} |",
-        f"| Files evaluated | {len(files) - len(overflow)} |",
-        f"| Files with retained findings | {len(findings)} |",
-        f"| Files not evaluated after cap | {len(overflow)} |",
-        f"| Symlinks skipped | {codec.integer(discovery['skipped_symlinks'], 'skipped')} |",
-        "| Filesystem entries visited | "
-        f"{codec.integer(discovery['visited_entries'], 'visited')} |",
-        f"| Finding limit | {codec.integer(data['max_findings'], 'finding cap')} |",
-        f"| Stop reason | `{records.text(data, 'stop_reason')}` |",
-    )
-
-
-def _finding_index(
-    indexes: tuple[Mapping[str, object], ...],
-    children: dict[str, ValidatedScanFinding],
-) -> tuple[str, ...]:
-    lines = [
-        "| Source file | Reader failures | Semantic differences | Signals | Report |",
-        "|---|---:|---:|---|---|",
-    ]
-    for item in indexes:
-        finding_id = records.text(item, "finding_id")
-        child = children[finding_id]
-        outcomes = records.mappings(child.record.data["outcomes"], "outcomes")
-        comparisons = records.mappings(child.record.data["comparisons"], "comparisons")
-        failures = sum(records.text(outcome, "kind") != "SUCCESS" for outcome in outcomes)
-        signals = Counter(value.signal.value for value in scan_child_occurrences((child,)))
-        signal_text = ", ".join(f"{name}: {count}" for name, count in sorted(signals.items()))
-        lines.append(
-            f"| {markdown_literal(child.record.source_path)} | {failures} | {len(comparisons)} | "
-            f"{signal_text} | [open finding](findings/{finding_id}/REPORT.md) |"
-        )
-    return tuple(lines)
-
-
-def _unevaluated_files(paths: tuple[str, ...]) -> tuple[str, ...]:
-    return (
-        "## Files not evaluated after the finding cap",
-        "",
-        "These are files, not additional findings. Parquity did not run readers on them:",
-        "",
-        *(f"- {markdown_literal(path)}" for path in paths),
-    )
-
-
-def _family_section(families: tuple[Family, ...]) -> tuple[str, ...]:
-    occurrences = sum(len(family.occurrences) for family in families)
-    lines = [
-        "## Symptom families",
-        "",
-        f"Parquity grouped **{occurrences}** occurrences into **{len(families)}** conservative",
-        "families. Families help navigate repetition; they do not claim root-cause identity.",
-        "",
-        "| Signal | Occurrences | Representative file | Representative report |",
-        "|---|---:|---|---|",
-    ]
-    for family in families:
-        representative = family.representative
-        lines.append(
-            f"| `{family.signal.value}` | {len(family.occurrences)} | "
-            f"{markdown_literal(representative.reference_value)} | "
-            f"[open finding](findings/{representative.finding_id}/REPORT.md) |"
-        )
-    return tuple(lines)
-
-
-def _engines(engines: tuple[EngineVersion, ...]) -> str:
-    return ", ".join(f"{engine.name} {engine.version}" for engine in engines)
-
-
-def _template(name: str) -> str:
-    return Path(__file__).with_name(f"{name}.tmpl").read_text(encoding="utf-8")
+def _environment_details(environment: EnvironmentEvidence) -> tuple[DetailView, ...]:
+    return tuple(item for item in environment_details(environment) if item.label != "Hypothesis")

@@ -9,7 +9,6 @@ Choose a command from the input you already have:
 | Exact schema, unknown troublesome values | `fuzz --schema` | Generated rows under your fixed schema |
 | Existing Parquet bytes | `scan` | Independent reader observations against each other |
 | Saved evidence | `replay` | A fresh evaluation against the recorded target |
-| Symptom families from a saved run | `triage` | Filtered families or replay-bound states |
 
 `check` and `fuzz` use a [Case](cases.md): the logical schema and rows that
 should survive serialization. `scan` has no Case and no reference reader; it
@@ -27,7 +26,7 @@ parquity smoke
 `engines` reports installed providers, versions, supported directions, tiers,
 and declared Python support. `smoke` runs the three core writers against the
 three core readers using a built-in Case. On a terminal these commands print
-compact tables; `smoke` does not create a bundle.
+compact tables; `smoke` does not save evidence.
 
 Run `parquity <command> --help` for command-specific arguments, options,
 defaults, and exit behavior. Interactive terminals receive a human-readable
@@ -36,8 +35,7 @@ Pass `--json` to force that canonical machine output on a terminal.
 
 ## Platform support
 
-Parquity 0.1.0 supports Linux and macOS. Windows is not supported in this
-release.
+Parquity supports Linux and macOS. Windows is not currently supported.
 
 `scan` and replay of scan evidence require POSIX process-group supervision for
 timeouts and descendant cleanup. The pure-Python wheel may install on another
@@ -45,7 +43,7 @@ platform; installation alone does not establish support for its commands.
 
 ## Execution model
 
-`check`, `fuzz`, `smoke`, and replay of generated findings load providers in
+`check`, `fuzz`, `smoke`, and replay of generated evidence load providers in
 Parquity's main process. A native provider crash can therefore terminate the
 command before Parquity can publish a result.
 
@@ -78,8 +76,18 @@ parquity check case.json --out duckdb-to-pyarrow \
 
 If every selected cell matches the Case, `check` exits 0 with `NO_FINDING` and
 does not create `check-run`. Any non-passing cell exits 1 and publishes an
-aggregate run containing one standalone finding for each retained
-observation.
+run directory with a report and a standalone reproducer for each retained
+failure.
+
+Parquity may reduce a failing supplied Case to a smaller table that preserves
+the same exact failure. The saved `case.json` is the reduced reproducer. When
+reduction changes the input, `discovered_case.json` preserves the supplied
+Case that exposed the failure.
+
+`check` has no additional table-size limit beyond Case validation and available
+process resources. Its writers and readers run in the main process, so a large
+Case can consume substantial memory or terminate the command through provider
+failure.
 
 See [Writing Cases](cases.md) for the JSON model and supported values.
 
@@ -89,7 +97,7 @@ Generic fuzz searches small schemas, rows, nested values, nullability, and
 boundary values:
 
 ```console
-parquity fuzz --examples 100 --seed 42 --max-findings 8 --out fuzz-run
+parquity fuzz --examples 100 --seed 42 --max-saved 8 --out fuzz-run
 ```
 
 Generic fuzz is useful when you maintain or integrate a Parquet engine and do
@@ -97,28 +105,29 @@ not want to predict the failing schema first. The generated Cases are small on
 purpose: they isolate an interoperability boundary and make a failure cheap to
 inspect and reproduce.
 
-`--examples` is the maximum discovery budget. `--seed` must be an integer from 0 through
-2^64 - 1. A seed is repeatable only with the same Parquity, Hypothesis, Python,
-and provider environment. The reduced `case.json` saved with a finding is the
-durable reproducer.
+`--examples` is the maximum discovery budget. `--seed` must be an integer from
+0 through 2^64 - 1. A seed is repeatable only with the same Parquity,
+Hypothesis, Python, and provider environment. The reduced `case.json` in a
+saved reproducer is the durable input.
 
-The example limit and finding cap are competing bounds. Fuzz retains up to
-`--max-findings` distinct fingerprints as complete finding bundles. If it sees
-another distinct fingerprint after reaching that cap, it records bounded
-overflow and stops discovery early. Overflow fingerprints are not complete
-findings, and their count is only a known lower bound: the campaign did not
-evaluate the rest of its search space. The default finding cap is 8; the
-maximum is 64.
+Parquity deduplicates equivalent failures. `--max-saved N` saves at most N
+minimized reproducers; additional distinct failures remain in `run.json` but
+do not receive standalone reproducer directories. Replay evaluates saved
+reproducers only. The default limit is 8; the maximum is 64.
+
+`--examples` is an upper bound. A finite schema strategy may run out of
+distinct tables first; the run then records `STRATEGY_EXHAUSTED` rather than
+claiming that the example bound was reached.
 
 ## Search values under a fixed schema
 
 Use schema-aware fuzz when your pipeline schema is known but troublesome rows
-are not. Supply an ordinary Case with the exact schema and an empty `rows`
-array:
+are not. Supply a `parquity.case.v1` document using Case grammar, the exact
+schema, and `rows: []`:
 
 ```console
 parquity fuzz --schema schema.json --examples 100 --seed 42 \
-  --max-findings 8 --out schema-run
+  --max-saved 8 --out schema-run
 ```
 
 Parquity generates and reduces only rows and values. Field order, names,
@@ -126,7 +135,7 @@ types, parameters, and nullability remain fixed. A non-empty template or a
 schema outside the documented generation budgets is rejected before any
 provider runs.
 
-Schema-aware findings contain the same canonical `case.json` accepted by
+Schema-aware reproducers contain the same canonical `case.json` accepted by
 `check`. See the copyable template in [Writing Cases](cases.md).
 
 ## Scan existing Parquet files
@@ -143,7 +152,7 @@ selects regular `.parquet` files without following symlinks:
 ```console
 parquity scan parquet-directory --out scan-run \
   --engines pyarrow,duckdb,polars,datafusion \
-  --timeout 30 --max-findings 32
+  --timeout 30 --max-saved 32
 ```
 
 Each reader observes a private snapshot in a fresh, sequential child process.
@@ -156,10 +165,14 @@ Directory discovery and retained evidence are bounded:
 - at most 4,096 visited entries and 256 accepted files;
 - at most 64 MiB per file and 512 MiB of accepted source bytes in total;
 - a 1–300 second timeout per reader-file cell; and
-- at most 64 retained findings.
+- saved evidence for at most 64 source files.
 
-Reaching the finding cap before every accepted file is evaluated is recorded
-as a non-exhaustive stop with bounded overflow.
+Reaching the saved-evidence limit before every accepted file is evaluated is
+recorded as a non-exhaustive stop. The remaining accepted files are listed as
+not evaluated.
+
+Scan supervision currently requires a POSIX platform. Windows support is
+demand-driven; open an issue if you need it.
 
 These are discovery and retained-evidence bounds, not hard memory limits. They
 do not bound every allocation or decompression step performed inside a
@@ -172,53 +185,32 @@ disk, or decompression work. Run files of uncertain provenance in an
 operating-system or container boundary with least privilege and appropriate
 resource limits.
 
-## Replay recorded evidence
+## Replay saved evidence
 
-Replay accepts a standalone generated finding, a generated aggregate, a
-standalone scan finding, or a scan aggregate:
+Replay accepts a standalone generated reproducer, a generated run directory,
+a standalone scan evidence directory, or a scan run directory:
 
 ```console
 parquity replay run-directory
 ```
 
-Replay validates the complete inventory and hash chain before resolving the
-recorded providers and options. It does not execute either reproduction script
-stored in the bundle.
+Replay validates the complete artifact inventory and all recorded digests
+before resolving the recorded providers and options. Run replay evaluates
+saved reproducers only. It does not execute either reproduction script stored
+with the evidence.
 
-Replay exits 1 when at least one recorded target reproduces exactly. This is a
-finding result, not a command failure. Save canonical replay output before
-binding it into triage:
+Save canonical replay output when another tool needs the result:
 
 ```console
 parquity replay run-directory --json > replay.json
-parquity triage run-directory --replay-evidence replay.json
 ```
 
-The states `REPRODUCED`, `RELATED_FAILURE`, `NOT_REPRODUCED`, and `NOT_CHECKED`
-are defined in [Evidence and replay](evidence.md).
+Exit 1 means at least one recorded target reproduced exactly; it is a replay
+result, not a command failure. With `--json`, a completed replay writes only
+canonical JSON to stdout and leaves stderr empty.
 
-## Inspect automatic symptom families
-
-Generated and scan aggregate reports already contain deterministic symptom
-families. The `triage` command is an optional read-only view for filtering those
-families or attaching replay states:
-
-```console
-parquity triage run-directory
-parquity triage run-directory --focus execution
-parquity triage run-directory --focus data
-parquity triage run-directory --focus schema
-```
-
-`triage` validates the bundle and derives the same grouping by signal and
-evidence shape. It starts no providers or child processes and does not modify
-the bundle. `--focus` changes only the displayed family list; the complete
-finding, occurrence, and family counts remain unchanged. Add `--json` when the
-result will be consumed by a script or saved as structured evidence.
-
-A symptom family is not a root-cause or defect count. See
-[Evidence and replay](evidence.md) before turning a family into an upstream
-issue.
+The states `REPRODUCED`, `RELATED_FAILURE`, and `NOT_REPRODUCED` are defined in
+[Evidence and replay](evidence.md).
 
 ## Add writer profiles
 
@@ -246,8 +238,7 @@ format from the destination:
 
 Color and terminal hyperlinks are omitted when stdout is not a terminal, when
 `NO_COLOR` is set, or when `TERM=dumb`. Published `check`, `fuzz`, and `scan`
-summaries link to `REPORT.md` on capable terminals and show the same path as
-plain text otherwise.
+summaries show the published output directory.
 
 The canonical JSON document carries a command-specific successful status:
 
@@ -257,17 +248,27 @@ The canonical JSON document carries a command-specific successful status:
 | `smoke` | `PASS` |
 | `check`, `fuzz` | `NO_FINDING` |
 | `scan` | `AGREEMENT` |
-| `triage` | `TRIAGED` |
 
 | Exit | Meaning |
 |---:|---|
-| 0 | The command completed without a finding; replay had no exact reproduction; or triage completed. |
-| 1 | A disagreement was observed, or replay reproduced at least one recorded target. |
-| 2 | Usage, input, provider, resource, output, bundle, or replay-evidence validation failed. |
+| 0 | The command completed without a failure, or replay had no exact reproduction. |
+| 1 | A failure or semantic disagreement was recorded, or replay reproduced at least one saved target. |
+| 2 | Usage, input, provider, resource, output, or saved-evidence validation failed. |
 | 3 | An unexpected internal, worker-protocol, publication, or artifact-validation failure prevented a valid result. |
 
 `check`, `fuzz`, and `scan` publish the requested directory only when they have
 a complete run to report. Every command writes its immediate result to stdout;
 human terminal output is only a projection of the same result represented by
-canonical JSON. See [Evidence and replay](evidence.md) for bundle layouts and
+canonical JSON. See [Evidence and replay](evidence.md) for saved layouts and
 what to inspect before sharing them.
+
+## After finding a failure
+
+1. Open `REPORT.md`.
+2. Follow `open` for the relevant failure.
+3. Run `python reproduce.py` for authoritative Parquity replay.
+4. Inspect `matrix.json` or the recorded reader outcomes for complete evidence.
+5. Run `python upstream_repro.py` for a direct provider-level reproduction.
+6. Check the recorded Parquity, Python, platform, provider, and dependency
+   versions.
+7. Review every retained file before sharing the reproducer.

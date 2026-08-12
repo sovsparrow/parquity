@@ -5,8 +5,6 @@ import io
 import json
 import multiprocessing
 import sys
-from collections.abc import Callable
-from importlib import import_module
 from pathlib import Path
 from typing import cast
 
@@ -16,7 +14,10 @@ import parquity.cli as cli
 from parquity.engines import EngineSelection
 from parquity.model import Case, Field, Kind, TypeSpec
 from parquity.runs.bundle import validate_run
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
+from parquity.verdicts import CellResult, MatrixRun, Verdict
+from tests.support.cli_import_contract import loaded_capability_modules
+from tests.support.cli_output import captured_payload as _payload
+from tests.support.generated_cli import patch_evaluator, selection_versions, write_case
 
 
 def _template() -> Case:
@@ -32,25 +33,12 @@ def _template() -> Case:
 
 def _write_template(path: Path) -> Case:
     case = _template()
-    path.write_bytes(case.canonical_bytes())
-    return case
-
-
-def _versions(
-    selection: EngineSelection,
-) -> tuple[tuple[EngineVersion, ...], tuple[EngineVersion, ...]]:
-    writers = tuple(
-        EngineVersion(item.identity.name, item.identity.version) for item in selection.writers
-    )
-    readers = tuple(
-        EngineVersion(item.identity.name, item.identity.version) for item in selection.readers
-    )
-    return writers, readers
+    return write_case(path, case)
 
 
 def _pass(case: Case, directory: Path, selection: EngineSelection) -> MatrixRun:
     del directory
-    writers, readers = _versions(selection)
+    writers, readers = selection_versions(selection)
     result = CellResult(
         writers[0].name,
         writers[0].version,
@@ -66,7 +54,7 @@ def _pass(case: Case, directory: Path, selection: EngineSelection) -> MatrixRun:
 
 def _failure(case: Case, directory: Path, selection: EngineSelection) -> MatrixRun:
     del directory
-    writers, readers = _versions(selection)
+    writers, readers = selection_versions(selection)
     result = CellResult(
         writers[0].name,
         writers[0].version,
@@ -79,19 +67,6 @@ def _failure(case: Case, directory: Path, selection: EngineSelection) -> MatrixR
         "Controlled",
     )
     return MatrixRun(case.case_id, (result,), (), writers, readers)
-
-
-def _patch_evaluator(
-    monkeypatch: pytest.MonkeyPatch,
-    evaluator: Callable[[Case, Path, EngineSelection], MatrixRun],
-) -> None:
-    workflow = import_module("parquity.generation.workflow")
-    monkeypatch.setattr(workflow, "evaluate_selected_case", evaluator)
-
-
-def _payload(capsys: pytest.CaptureFixture[str]) -> tuple[dict[str, object], str]:
-    streams = capsys.readouterr()
-    return cast(dict[str, object], json.loads(streams.out)), streams.err
 
 
 def _fuzz(
@@ -108,7 +83,7 @@ def _fuzz(
         str(examples),
         "--seed",
         "7",
-        "--max-findings",
+        "--max-saved",
         "1",
         "--writers",
         writers,
@@ -121,23 +96,12 @@ def _fuzz(
 
 
 def _invalid_schema_probe(arguments: list[str], result_path: str) -> None:
+    before = frozenset(sys.modules)
     stdout = io.StringIO()
     stderr = io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         exit_code = cli.main(arguments)
-    forbidden = (
-        "parquity.engines.pyarrow",
-        "parquity.engines.duckdb",
-        "parquity.engines.polars",
-        "parquity.engines.datafusion",
-        "parquity.engines.fastparquet",
-        "parquity.generation.workflow",
-    )
-    loaded = sorted(
-        name
-        for name in sys.modules
-        if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)
-    )
+    loaded = loaded_capability_modules(set(sys.modules).difference(before))
     result = {
         "exit_code": exit_code,
         "payload": json.loads(stdout.getvalue()),
@@ -209,7 +173,7 @@ def test_schema_and_generic_no_finding_outputs_keep_distinct_additive_shapes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     schema = _write_template(tmp_path / "schema.json")
-    _patch_evaluator(monkeypatch, _pass)
+    patch_evaluator(monkeypatch, _pass)
     schema_output = tmp_path / "schema-output"
     assert cli.main(_fuzz(tmp_path / "schema.json", schema_output)) == 0
     schema_payload, stderr = _payload(capsys)
@@ -226,14 +190,14 @@ def test_schema_and_generic_no_finding_outputs_keep_distinct_additive_shapes(
     assert not generic_output.exists()
 
 
-def test_schema_run_passes_check_replay_and_triage_with_bound_profile(
+def test_schema_run_passes_check_and_replay_with_bound_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     template_path = tmp_path / "schema.json"
     template = _write_template(template_path)
-    _patch_evaluator(monkeypatch, _failure)
+    patch_evaluator(monkeypatch, _failure)
     destination = tmp_path / "schema-run"
     assert cli.main(_fuzz(template_path, destination, examples=3)) == 1
     published, stderr = _payload(capsys)
@@ -268,7 +232,3 @@ def test_schema_run_passes_check_replay_and_triage_with_bound_profile(
     assert cli.main(["replay", str(destination)]) == 1
     replayed, stderr = _payload(capsys)
     assert stderr == "" and replayed["status"] == "REPRODUCED"
-    assert cli.main(["triage", str(destination)]) == 0
-    triaged, stderr = _payload(capsys)
-    assert stderr == "" and triaged["status"] == "TRIAGED"
-    assert (triaged["finding_bundle_count"], triaged["occurrence_count"]) == (1, 1)

@@ -1,4 +1,5 @@
 default_install_hook_types: [pre-commit, commit-msg]
+exclude: ^tests/fixtures/v0_1_0/
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

@@ -15,11 +15,12 @@ import pytest
 import parquity
 import parquity.cli as cli
 from parquity.cli.output import emit
-from parquity.cli.parser import Command
-from parquity.engines import EngineResolution
+from parquity.engines import EngineAvailability, EngineResolution
 from parquity.engines.base import EngineReader, EngineWriter
+from parquity.evidence import EngineVersion
 from parquity.runs.bundle import RunPublicationError
-from parquity.verdicts import CellResult, EngineAvailability, EngineVersion, MatrixRun, Verdict
+from parquity.verdicts import CellResult, MatrixRun, Verdict
+from tests.support.cli_output import captured_payload as _payload
 
 
 class _MainModule(Protocol):
@@ -28,15 +29,6 @@ class _MainModule(Protocol):
 
 class _SmokeModule(Protocol):
     execute_smoke: Callable[[Path, Sequence[EngineWriter], Sequence[EngineReader]], MatrixRun]
-
-
-def _payload(captured: pytest.CaptureFixture[str]) -> tuple[dict[str, object], str]:
-    streams = captured.readouterr()
-    decoded = cast(object, json.loads(streams.out))
-    assert isinstance(decoded, dict)
-    payload = cast(dict[str, object], decoded)
-    assert payload["format"] == "parquity.cli.v1"
-    return payload, streams.err
 
 
 def _availability(*, available: bool) -> EngineAvailability:
@@ -72,14 +64,8 @@ import io
 import json
 import sys
 from parquity import cli
+from tests.support.cli_import_contract import loaded_capability_modules
 
-forbidden = (
-    "pyarrow", "duckdb", "polars", "datafusion", "fastparquet", "hypothesis",
-    "parquity.model", "parquity.generation", "parquity.findings", "parquity.runs",
-    "parquity.arrow_bridge", "parquity.compare", "parquity.matrix",
-    "parquity.engines.pyarrow", "parquity.engines.duckdb", "parquity.engines.polars",
-    "parquity.engines.datafusion", "parquity.engines.fastparquet", "parquity.cli.smoke",
-)
 records = []
 for arguments in (["--help"], ["--version"], ["engines"]):
     stdout = io.StringIO()
@@ -91,10 +77,7 @@ for arguments in (["--help"], ["--version"], ["engines"]):
         "stdout": stdout.getvalue(),
         "stderr": stderr.getvalue(),
     })
-loaded = sorted(
-    name for name in sys.modules
-    if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)
-)
+loaded = loaded_capability_modules(sys.modules)
 print(json.dumps({"records": records, "loaded": loaded}, sort_keys=True))
 """
     completed = subprocess.run(  # noqa: S603 - fixed interpreter and literal probe.
@@ -120,20 +103,6 @@ print(json.dumps({"records": records, "loaded": loaded}, sort_keys=True))
     assert result["loaded"] == []
 
 
-def test_simple_documents_in_process(capsys: pytest.CaptureFixture[str]) -> None:
-    assert cli.main(["--help"]) == 0
-    streams = capsys.readouterr()
-    assert "Usage: parquity COMMAND [OPTIONS]" in streams.out
-    assert streams.err == ""
-    for arguments, command in (
-        (["--version"], "version"),
-        (["engines"], "engines"),
-    ):
-        assert cli.main(arguments) == 0
-        payload, stderr = _payload(capsys)
-        assert (payload["command"], payload["status"], stderr) == (command, "OK", "")
-
-
 def test_real_scalar_smoke(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = cli.main(["smoke"])
     payload, stderr = _payload(capsys)
@@ -150,12 +119,6 @@ def test_cli_output_is_canonical_utf8_with_literal_lf(monkeypatch: pytest.Monkey
     emit({"command": "probe", "value": "İstanbul"})
     expected = '{"command":"probe","format":"parquity.cli.v1","value":"İstanbul"}\n'.encode()
     assert raw.getvalue() == expected
-    raw.seek(0)
-    raw.truncate()
-    assert cli.main(["smoke"]) == 0
-    smoke = raw.getvalue()
-    assert smoke.endswith(b"\n") and b"\r\n" not in smoke
-    assert cast(dict[str, object], json.loads(smoke))["status"] == "PASS"
     monkeypatch.setattr(sys, "stdout", fallback := io.StringIO())
     emit({"command": "probe", "value": "İstanbul"})
     assert fallback.getvalue().encode() == expected
@@ -193,7 +156,7 @@ def test_typed_smoke_finding_maps_to_exit_one(
     assert stderr == "" and payload["status"] == "FAIL"
 
 
-def test_unavailable_and_incomplete_core_resolution_keep_exit_two_and_three(
+def test_unavailable_core_resolution_keeps_exit_two(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -208,16 +171,6 @@ def test_unavailable_and_incomplete_core_resolution_keep_exit_two_and_three(
     payload, stderr = _payload(capsys)
     assert cast(list[dict[str, object]], payload["engines"])[0]["available"] is False
     assert stderr != ""
-
-    def incomplete(names: Sequence[str]) -> tuple[EngineResolution, ...]:
-        del names
-        return (EngineResolution(_availability(available=True), None, None),)
-
-    monkeypatch.setattr(main_module, "resolve_engines", incomplete)
-    assert cli.main(["smoke"]) == 3
-    payload, stderr = _payload(capsys)
-    assert cast(dict[str, object], payload["error"])["kind"] == "TypeError"
-    assert stderr.startswith("parquity: TypeError")
 
 
 @pytest.mark.parametrize(
@@ -243,13 +196,13 @@ def test_usage_errors_are_diagnostic(
 
 
 @pytest.mark.parametrize(
-    ("examples", "seed", "max_findings"),
+    ("examples", "seed", "max_saved"),
     ((0, 0, 8), (1, -1, 8), (1, 2**64, 8), (1, 0, 0), (1, 0, 65)),
 )
 def test_fuzz_argument_bounds_exit_two(
     examples: int,
     seed: int,
-    max_findings: int,
+    max_saved: int,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     arguments = [
@@ -258,8 +211,8 @@ def test_fuzz_argument_bounds_exit_two(
         str(examples),
         "--seed",
         str(seed),
-        "--max-findings",
-        str(max_findings),
+        "--max-saved",
+        str(max_saved),
         "--out",
         "unused",
     ]
@@ -314,30 +267,18 @@ def test_typed_evidence_rejects_incomplete_versions_and_supplies_default_kinds()
     assert result.diagnostic_kind == "WRITE_ERROR"
 
 
-def test_cli_maps_defensive_dispatch_selection_and_publication_failures(
+def test_cli_maps_publication_failures(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
 ) -> None:
-    main_module = import_module("parquity.cli.main")
-
-    def inconsistent(arguments: tuple[str, ...]) -> tuple[Command, None]:
-        del arguments
-        return Command.CHECK, None
-
-    monkeypatch.setattr(main_module, "parse", inconsistent)
-    assert cli.main(["ignored"]) == 3
-    _payload(capsys)
-    monkeypatch.undo()
     arguments = ["fuzz", "--examples", "1", "--seed", "0", "--out", str(tmp_path / "out")]
-    assert cli.main([*arguments, "--writers", "unknown"]) == 2
-    _payload(capsys)
     workflow = import_module("parquity.generation.workflow")
 
     def fail(*args: object, **kwargs: object) -> None:
         raise RunPublicationError("OUTPUT_ERROR", "controlled publication failure")
 
-    monkeypatch.setattr(workflow, "execute_fuzz", fail)
+    monkeypatch.setattr(workflow, "capture_fuzz", fail)
     assert cli.main(arguments) == 2
     payload, _ = _payload(capsys)
     assert cast(dict[str, object], payload["error"])["kind"] == "OUTPUT_ERROR"

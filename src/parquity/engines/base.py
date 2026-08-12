@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
+
+from ..evidence import EngineVersion, bounded_detail
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
-    from ..writer_profiles import WriterProfileIdentity
+    from ..profiles import WriterProfileIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,10 +30,7 @@ class EngineDescriptor:
             raise ValueError("an engine must declare at least one direction")
 
 
-@dataclass(frozen=True, slots=True)
-class EngineIdentity:
-    name: str
-    version: str
+EngineIdentity: TypeAlias = EngineVersion
 
 
 class ProviderOperationError(Exception):
@@ -39,8 +38,7 @@ class ProviderOperationError(Exception):
         self.engine = engine
         self.operation = operation
         self.provider_type = type(cause).__name__
-        message = " ".join(str(cause).split())
-        self.detail = message[:500]
+        self.detail = bounded_detail(cause)
         super().__init__(f"{engine} {operation} failed: {self.provider_type}: {self.detail}")
 
 

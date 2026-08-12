@@ -7,7 +7,7 @@ from typing import Protocol, cast
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ..writer_profiles import WriterProfileIdentity
+from ..profiles import WriterProfileIdentity
 from .base import EngineIdentity, EngineReaderWriter, ProviderOperationError
 
 

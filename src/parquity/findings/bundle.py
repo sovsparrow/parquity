@@ -1,23 +1,31 @@
 from __future__ import annotations
 
-import hashlib
-import shutil
 import stat
-import sys
-import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
-from ..generation import CaseEvaluator
+from ..evidence import EngineVersion, EnvironmentEvidence, sha256_hex
+from ..evidence import json_codec as codec
+from ..evidence.storage import (
+    DestinationExistsError,
+    remove_tree,
+    require_destination_absent,
+)
+from ..generation.evidence import DiscoveryEvidence, GenerationEvidence
 from ..model import Case
-from ..verdicts import CellResult, EngineVersion, FailureFingerprint, MatrixRun
-from ..writer_profiles import WriterProfilePlan
+from ..profiles import WriterProfilePlan
+from ..reporting.markdown import render_evidence_report
+from ..verdicts import CaseEvaluator, CellResult, FailureFingerprint, MatrixRun
 from . import OPTIONAL_DISCOVERED_CASE, OPTIONAL_INPUT
-from . import json_codec as codec
-from .evidence import DiscoveryEvidence, EnvironmentEvidence, GenerationEvidence, ReductionEvidence
 from .matrix import MatrixRecord
-from .model import ArtifactDigest, FindingRecord, ReplaySignature, finding_id_for
-from .report import render_finding_report
+from .model import (
+    ArtifactDigest,
+    FindingRecord,
+    ReductionEvidence,
+    ReplaySignature,
+    finding_id_for,
+)
+from .report import FindingReportContext, build_evidence_report_view
 from .scripts import render_reproduce
 from .upstream_script import render_upstream_repro
 
@@ -87,19 +95,19 @@ def load_case(path: Path, destination: Path) -> Case:
 
 def ensure_destination_absent(destination: Path) -> None:
     try:
-        destination.lstat()
-    except FileNotFoundError:
-        return
+        require_destination_absent(destination)
+    except DestinationExistsError as error:
+        raise BundlePublicationError("OUTPUT_EXISTS", "output path already exists") from error
     except OSError as error:
         raise _output_error() from error
-    raise BundlePublicationError("OUTPUT_EXISTS", "output path already exists")
 
 
 def build_bundle(
     source: FindingSource,
     directory: Path,
     evaluator: CaseEvaluator,
-) -> FindingRecord:
+    report_context: FindingReportContext | None = None,
+) -> ValidatedBundle:
     ensure_destination_absent(directory)
     try:
         directory.mkdir(parents=True)
@@ -119,10 +127,21 @@ def build_bundle(
     _remove_tree(evaluation_directory)
     finding_id = finding_id_for(source.case.case_id, source.fingerprint)
     payloads = _artifact_payloads(source, matrix, selected, input_payload)
-    provisional_payloads = {**payloads, "REPORT.md": b""}
+    report_payload = b""
+    if report_context is not None:
+        report_payload = render_evidence_report(
+            build_evidence_report_view(
+                source,
+                finding_id,
+                matrix,
+                selected,
+                report_context,
+            )
+        )
+    payloads["REPORT.md"] = report_payload
     artifacts = tuple(
-        ArtifactDigest(name, hashlib.sha256(payload).hexdigest(), len(payload))
-        for name, payload in sorted(provisional_payloads.items())
+        ArtifactDigest(name, sha256_hex(payload), len(payload))
+        for name, payload in sorted(payloads.items())
     )
     finding = FindingRecord(
         finding_id=finding_id,
@@ -141,51 +160,13 @@ def build_bundle(
         generation=source.generation,
         writer_profiles=source.writer_profiles,
     )
-    payloads["REPORT.md"] = render_finding_report(finding, source.case, matrix)
     try:
         for name, payload in sorted(payloads.items()):
             (directory / name).write_bytes(payload)
-    except OSError as error:
-        raise _output_error() from error
-    artifacts = tuple(
-        ArtifactDigest(name, hashlib.sha256(payload).hexdigest(), len(payload))
-        for name, payload in sorted(payloads.items())
-    )
-    finding = replace(finding, artifacts=artifacts)
-    try:
         (directory / "finding.json").write_bytes(finding.canonical_bytes())
     except OSError as error:
         raise _output_error() from error
-    validate_bundle(directory)
-    return finding
-
-
-def publish_bundle(
-    source: FindingSource,
-    destination: Path,
-    evaluator: CaseEvaluator,
-) -> FindingRecord:
-    ensure_destination_absent(destination)
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        root = Path(
-            tempfile.mkdtemp(prefix=f".{destination.name}.parquity-", dir=destination.parent)
-        )
-    except OSError as error:
-        raise _output_error() from error
-    staging = root / "finding"
-    published = False
-    try:
-        finding = build_bundle(source, staging, evaluator)
-        ensure_destination_absent(destination)
-        try:
-            staging.rename(destination)
-        except OSError as error:
-            _raise_publish_error(destination, error)
-        published = True
-        return finding
-    finally:
-        _remove_tree(root, preserve_active_error=sys.exc_info()[0] is not None and not published)
+    return validate_bundle(directory)
 
 
 def validate_bundle(directory: Path) -> ValidatedBundle:
@@ -212,14 +193,13 @@ def validate_bundle(directory: Path) -> ValidatedBundle:
         if not codec.is_canonical_json(matrix_payload):
             raise BundleValidationError("INVALID_BUNDLE", "matrix.json is not canonical")
         _validate_matrix(finding, matrix)
-        report = (directory / "REPORT.md").read_bytes()
-        if report != render_finding_report(finding, case, matrix):
-            raise BundleValidationError("INVALID_BUNDLE", "finding report does not match")
         return ValidatedBundle(finding, case, discovered, matrix, directory)
     except BundleValidationError:
         raise
     except (OSError, ValueError) as error:
-        raise BundleValidationError("INVALID_BUNDLE", "finding validation failed") from error
+        raise BundleValidationError(
+            "INVALID_BUNDLE", f"finding validation failed: {error}"
+        ) from error
 
 
 def _artifact_payloads(
@@ -288,7 +268,7 @@ def _validate_artifacts(directory: Path, finding: FindingRecord) -> None:
 def _canonical_case(path: Path) -> Case:
     payload = path.read_bytes()
     case = Case.from_json(payload)
-    if case.canonical_bytes() != payload:
+    if not codec.canonical_bytes_match(payload, case.to_data()):
         raise BundleValidationError("INVALID_BUNDLE", f"{path.name} is not canonical")
     return case
 
@@ -318,22 +298,11 @@ def _matching_result(run: MatrixRun, fingerprint: FailureFingerprint) -> CellRes
     return next((result for result in run.failures if result.fingerprint == fingerprint), None)
 
 
-def _raise_publish_error(destination: Path, error: OSError) -> None:
-    try:
-        ensure_destination_absent(destination)
-    except BundlePublicationError as destination_error:
-        raise destination_error from error
-    raise _output_error() from error
-
-
 def _remove_tree(path: Path, *, preserve_active_error: bool = False) -> None:
     try:
-        shutil.rmtree(path)
-    except FileNotFoundError:
-        return
+        remove_tree(path, preserve_active_error=preserve_active_error)
     except OSError as error:
-        if not preserve_active_error:
-            raise _output_error() from error
+        raise _output_error() from error
 
 
 def _output_error() -> BundlePublicationError:

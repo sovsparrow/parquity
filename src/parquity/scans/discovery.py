@@ -7,10 +7,7 @@ import stat
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple
 
-MAX_FILES = 256
-MAX_FILE_BYTES = 64 * 1024 * 1024
-MAX_SOURCE_BYTES = 512 * 1024 * 1024
-MAX_VISITED_ENTRIES = 4096
+from .limits import MAX_FILE_BYTES, MAX_FILES, MAX_SOURCE_BYTES, MAX_VISITED_ENTRIES
 
 
 class ScanConfigurationError(ValueError):

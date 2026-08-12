@@ -9,17 +9,13 @@ from hypothesis.strategies import SearchStrategy
 
 from ..case import decimal_from_coefficient, semantic_key_bytes
 from ..model import Case, Field, Kind, TypeSpec
+from .limits import MAX_DEPTH, MAX_LIST_WIDTH, MAX_NODES, MAX_ROWS, MAX_SLOTS
 
 MAX_FIELDS = 4
-MAX_ROWS = 4
 MAX_STRING_SIZE = 12
 MAX_BINARY_SIZE = 12
-MAX_LIST_WIDTH = 4
 MAX_FIXED_LIST_SIZE = 4
 MAX_STRUCT_FIELDS = 3
-MAX_DEPTH = 4
-MAX_NODES = 128
-MAX_SLOTS = 256
 
 _PLAIN_SCALARS = (Kind.BOOL, Kind.INT32, Kind.INT64, Kind.STRING, Kind.BINARY)
 _EXTENDED_SCALARS = (Kind.FLOAT32, Kind.FLOAT64, Kind.DATE32, Kind.TIMESTAMP, Kind.DECIMAL128)

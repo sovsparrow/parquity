@@ -68,39 +68,31 @@ Install the new wheel into a clean environment and exercise the affected CLI
 path from outside the repository. Provider changes should be checked with the
 real provider, not a replacement module.
 
-## Test standard
+## Tests and code organization
 
-Tests should name a plausible behavioral regression and use an independent
-oracle. Prefer public outcomes: canonical bytes, schemas, values, exit codes,
-validated artifacts, and typed errors.
+Add tests for behavior changed by the contribution and for regressions being
+fixed. Prefer stable, caller-visible outcomes such as schemas, values, exit
+codes, validated files, and typed errors. Keep tests deterministic and offline;
+avoid timing-dependent assertions and broad snapshots when a direct assertion
+can explain the behavior.
 
-Do not add sleeps, network access, snapshots, recorded responses, retries,
-quarantine markers, persistent Hypothesis state, or tests that only import a
-module or echo a constant. Coverage is evidence of exercised behavior, not a
-reason to invent a test.
+Use a focused test while editing, then run the complete suite before opening a
+pull request. Coverage is informational and has no percentage gate.
 
-Keep Python modules at or below 350 physical lines and callables at or below
-100 physical lines. `scripts/check_structure.py` enforces those bounds and the
-declared import boundaries.
+The structure check limits modules to 600 physical lines and callables to 150,
+and also checks package boundaries and naming. Treat these limits as guardrails:
+do not create thin modules or packages solely to reduce a line count. Organize
+code around coherent responsibilities.
 
-Process tests use bounded child programs and readiness signals. Real
-crash-prone provider inputs belong in local acceptance evidence, not the normal
-test suite.
+Tests that exercise child processes must use bounded programs and reliable
+readiness signals. Test real provider behavior with the provider installed.
 
 ## Documentation changes
 
-Put each fact in one owning document:
-
-- `README.md` explains the product, the two comparison models, and the first
-  useful commands;
-- `docs/usage.md` owns command syntax, outputs, exits, and operational warnings;
-- `docs/cases.md` owns the Case grammar and generated-value bounds;
-- `docs/evidence.md` owns bundle layouts, replay, triage vocabulary, and
-  retained-data guidance;
-- `docs/providers.md` and `docs/writer-profiles.md` own provider selection and
-  writer-option support;
-- `VERSIONING.md` owns package release and public compatibility policy; and
-- `SECURITY.md` owns private vulnerability reporting.
+Update `README.md` when the overview or quickstart changes. Put detailed
+guidance under `docs/` and link to it instead of repeating the same contract in
+several places. Compatibility policy belongs in `VERSIONING.md`; private
+vulnerability reporting belongs in `SECURITY.md`.
 
 Commands and JSON in public documentation must be run against a freshly built
 wheel. Check the rendered README with `twine check`, verify its links resolve

@@ -9,12 +9,11 @@ actions are documented: [Using Parquity](docs/usage.md) and
 
 Parquity provides security fixes for its latest published release. Older
 releases and unreleased source checkouts have no security-support commitment.
-Before the first package release, there is no supported published version.
 
 ## Report a vulnerability
 
 Use the repository's **Security → Report a vulnerability** form. Do not place a
-suspected vulnerability, proof of concept, sensitive input, or private bundle
+suspected vulnerability, reproduction steps, sensitive input, or private bundle
 in a public issue.
 
 Include, when available:

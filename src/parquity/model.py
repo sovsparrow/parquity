@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from .case import Field, Kind, TypeSpec, decode_value, encode_value, normalize_value, validate_value
+from .case import Field, Kind, TypeSpec, decode_value, encode_value, normalize_value
+from .evidence import json_codec
+from .evidence.digests import sha256_hex
 
 CASE_FORMAT = "parquity.case.v1"
 
@@ -39,16 +38,10 @@ class Case:
 
     @property
     def case_id(self) -> str:
-        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+        return sha256_hex(self.canonical_bytes())
 
     def canonical_bytes(self) -> bytes:
-        return json.dumps(
-            self.to_data(),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
+        return json_codec.canonical_bytes(self.to_data())
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -70,12 +63,12 @@ class Case:
         if data["format"] != CASE_FORMAT:
             raise ValueError(f"case format must be {CASE_FORMAT!r}")
         fields = tuple(
-            Field.from_data(_mapping(value, "schema field"))
-            for value in _sequence(data["schema"], "schema")
+            Field.from_data(json_codec.mapping(value, "schema field"))
+            for value in json_codec.sequence(data["schema"], "schema")
         )
         rows: list[tuple[object, ...]] = []
-        for row_index, raw_row in enumerate(_sequence(data["rows"], "rows")):
-            values = _sequence(raw_row, f"row {row_index}")
+        for row_index, raw_row in enumerate(json_codec.sequence(data["rows"], "rows")):
+            values = json_codec.sequence(raw_row, f"row {row_index}")
             if len(values) != len(fields):
                 raise ValueError(f"row {row_index} has the wrong width")
             rows.append(
@@ -88,51 +81,7 @@ class Case:
 
     @classmethod
     def from_json(cls, payload: str | bytes) -> Case:
-        decoded = cast(
-            object,
-            json.loads(
-                payload,
-                object_pairs_hook=_unique_object,
-                parse_constant=_reject_non_finite,
-                parse_float=_finite_float,
-            ),
-        )
-        return cls.from_data(_mapping(decoded, "case"))
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON field: {key}")
-        result[key] = value
-    return result
-
-
-def _reject_non_finite(value: str) -> object:
-    raise ValueError(f"raw JSON non-finite token is invalid: {value}")
-
-
-def _finite_float(value: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError("JSON numeric token exceeds the finite float range")
-    return parsed
-
-
-def _mapping(value: object, label: str) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{label} must be an object")
-    raw = cast(Mapping[object, object], value)
-    if any(not isinstance(key, str) for key in raw):
-        raise ValueError(f"{label} must be an object")
-    return cast(Mapping[str, object], raw)
-
-
-def _sequence(value: object, label: str) -> Sequence[object]:
-    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
-        raise ValueError(f"{label} must be an array")
-    return cast(Sequence[object], value)
+        return cls.from_data(json_codec.mapping(json_codec.decode(payload), "case"))
 
 
 __all__ = [
@@ -143,5 +92,4 @@ __all__ = [
     "TypeSpec",
     "decode_value",
     "encode_value",
-    "validate_value",
 ]

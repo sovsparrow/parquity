@@ -7,7 +7,7 @@ from typing import Protocol, cast
 import polars as pl
 import pyarrow as pa
 
-from ..writer_profiles import WriterProfileIdentity
+from ..profiles import WriterProfileIdentity
 from .base import EngineIdentity, EngineReaderWriter, ProviderOperationError
 
 
@@ -17,6 +17,10 @@ class _FromArrow(Protocol):
 
 class _PolarsModule(Protocol):
     from_arrow: _FromArrow
+
+
+class _WriteParquet(Protocol):
+    def __call__(self, file: str | Path, **options: object) -> None: ...
 
 
 _POLARS = cast(_PolarsModule, cast(object, pl))
@@ -53,14 +57,8 @@ class PolarsEngine:
             cause = cast(Exception, error)
             raise ProviderOperationError(self.identity.name, "write", cause) from error
         try:
-            if profile.name == "compression-gzip":
-                frame.write_parquet(path, compression="gzip")
-            elif profile.name == "compression-brotli":
-                frame.write_parquet(path, compression="brotli")
-            elif profile.name == "row-group-2":
-                frame.write_parquet(path, row_group_size=2)
-            else:
-                frame.write_parquet(path, statistics=False)
+            write_parquet = cast(_WriteParquet, frame.write_parquet)
+            write_parquet(path, **profile.effective_options)
         except (
             pl.exceptions.PolarsError,
             pl.exceptions.PanicException,

@@ -1,8 +1,5 @@
 import hashlib
-import json
 from dataclasses import replace
-from itertools import product
-from pathlib import Path
 from shlex import split as _words
 from typing import Any, cast
 
@@ -10,8 +7,6 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
-from parquity.scans import records
-from parquity.scans.bundle import build_finding
 from parquity.scans.observations import (
     Observation,
     ObservationMetadata,
@@ -19,30 +14,15 @@ from parquity.scans.observations import (
     group_observations,
     normalize_table,
 )
-from parquity.scans.observations import ObservationDifference as Difference
 from parquity.scans.observations import ObservationError as Error
 from parquity.scans.observations import ObservationGroup as Group
 from parquity.scans.observations import decode_observation as decode
-from parquity.scans.records import ReaderOutcomeRecord as Outcome
-from parquity.verdicts import EngineVersion
-
-FindingRecord, RecordError = records.ScanFindingRecord, records.ScanRecordError
-_FAIL_FIELDS = _words("row_count column_count schema_sha256 ipc_sha256 ipc_bytes observation_group")
-_FAILURE_CASES = tuple(product(("TIMEOUT", "PROCESS_CRASH"), ("diagnostic", "detail")))
-_DEFAULT = Difference("group-1", "group-2", "VALUE_DIFFERENCE", "$.rows[0].columns[0]", "1 != 2")
-_RECORD_MUTATIONS = _words(
-    "member_order group_order comparison_kind comparison_path source_dot source_nul "
-    "version_empty diagnostic_empty success_diagnostic success_detail"
-)
+from tests.support.scan_observation_values import named_value_difference as _named_value_difference
+from tests.support.scan_observation_values import observation as _observation
 
 
 def _field(container: object, index: int) -> "pa.Field[pa.DataType]":
     return cast(Any, container).field(index)
-
-
-def _observation(engine: str, table: pa.Table) -> Observation:
-    payload, metadata = encode_observation(table)
-    return decode(engine, payload, metadata)
 
 
 def _reject(error: type[BaseException], function: Any, *args: Any) -> None:
@@ -239,112 +219,8 @@ def test_difference_walks_equal_columns_and_reports_field_count() -> None:
     assert rows.path == "$.rows" and rows.detail == "row count 1 != 2"
 
 
-def _named_value_difference(name: str) -> Difference:
-    left = _observation("left", pa.Table.from_arrays([pa.array([1])], names=[name]))
-    right = _observation("right", pa.Table.from_arrays([pa.array([2])], names=[name]))
-    return group_observations((left, right)).differences[0]
-
-
 @pytest.mark.parametrize("name", ("", "a.b", "a[b]", "ünicode", "line\nbreak"))
 def test_value_path_uses_column_index_and_keeps_field_name_in_detail(name: str) -> None:
     difference = _named_value_difference(name)
     assert difference.path == "$.rows[0].columns[0]"
     assert difference.detail == f"column {name!r}: 1 != 2"
-
-
-def _record_outcome(engine: str, group: str, marker: str) -> Outcome:
-    status = ("SUCCESS", "SUCCESS", "", "", False, 1, 1)
-    return Outcome(engine, "1", *status, marker * 64, marker * 64, 16, group)
-
-
-def _finding_document(directory: Path, comparison: Difference | None = None) -> dict[str, object]:
-    difference = comparison or _DEFAULT
-    build_finding(
-        directory,
-        parquity_version="0.1.0",
-        source_path="input.parquet",
-        input_payload=b"PAR1controlled",
-        engines=tuple(EngineVersion(name, "1") for name in ("pyarrow", "duckdb", "polars")),
-        timeout_seconds=30,
-        outcomes=(
-            _record_outcome("pyarrow", "group-1", "a"),
-            _record_outcome("duckdb", "group-1", "a"),
-            _record_outcome("polars", "group-2", "b"),
-        ),
-        groups=(Group("group-1", ("pyarrow", "duckdb")), Group("group-2", ("polars",))),
-        comparisons=(difference,),
-    )
-    return cast(dict[str, object], json.loads((directory / "finding.json").read_bytes()))
-
-
-def _reseal_finding(document: dict[str, object]) -> None:
-    data, source = cast(dict[str, Any], document), cast(dict[str, Any], document["source"])
-    source_identity = (source["path"], source["sha256"], source["bytes"])
-    evidence = tuple(tuple(data[key]) for key in ("outcomes", "observation_groups", "comparisons"))
-    identity = records.signature(
-        *source_identity,
-        tuple(item["name"] for item in data["engines"]),
-        data["timeout_seconds"],
-        *evidence,
-    )
-    document["signature_sha256"] = identity
-    payload = records.canonical_bytes({"signature": identity})
-    document["finding_id"] = hashlib.sha256(payload).hexdigest()
-
-
-def test_empty_name_difference_validates_complete_finding(tmp_path: Path) -> None:
-    document = _finding_document(tmp_path / "empty-name", _named_value_difference(""))
-    _reseal_finding(document)
-    record = FindingRecord.from_json(records.canonical_bytes(document))
-    comparison = cast(list[dict[str, object]], record.data["comparisons"])[0]
-    assert comparison["path"] == "$.rows[0].columns[0]"
-    assert comparison["detail"] == "column '': 1 != 2"
-
-
-@pytest.mark.parametrize("mutation", _RECORD_MUTATIONS)
-def test_resealed_impossible_evidence_is_rejected(tmp_path: Path, mutation: str) -> None:
-    document = _finding_document(tmp_path / mutation)
-    outcomes = cast(list[dict[str, object]], document["outcomes"])
-    groups = cast(list[dict[str, object]], document["observation_groups"])
-    comparison = cast(list[dict[str, object]], document["comparisons"])[0]
-    if mutation == "member_order":
-        cast(list[str], groups[0]["engines"]).reverse()
-    elif mutation == "group_order":
-        outcomes[0]["observation_group"] = "group-2"
-        outcomes[1]["observation_group"] = "group-1"
-        groups[0]["engines"] = ["duckdb"]
-        groups[1]["engines"] = ["pyarrow", "polars"]
-    elif mutation == "comparison_kind":
-        comparison["kind"] = "UNSUPPORTED"
-    elif mutation == "comparison_path":
-        comparison["path"] = "$.rows[0].value"
-    elif mutation.startswith("source_"):
-        source = cast(dict[str, object], document["source"])
-        source["path"] = "." if mutation == "source_dot" else "input\0.parquet"
-    else:
-        target, key, value = {
-            "version_empty": (document, "parquity_version", ""),
-            "diagnostic_empty": (outcomes[0], "diagnostic_kind", ""),
-            "success_diagnostic": (outcomes[0], "diagnostic_kind", "OTHER"),
-            "success_detail": (outcomes[0], "detail", "unexpected"),
-        }[mutation]
-        target[key] = value
-    _reseal_finding(document)
-    _reject(RecordError, FindingRecord.from_json, records.canonical_bytes(document))
-
-
-@pytest.mark.parametrize(("kind", "mutation"), _FAILURE_CASES)
-def test_resealed_failure_conflicts_are_rejected(tmp_path: Path, kind: str, mutation: str) -> None:
-    document = _finding_document(tmp_path / f"{kind}-{mutation}")
-    outcomes = cast(list[dict[str, object]], document["outcomes"])
-    failure = outcomes.pop()
-    failure.update(kind=kind, diagnostic_kind=kind, detail="retained", stderr="retained")
-    failure.update(dict.fromkeys(_FAIL_FIELDS))
-    outcomes.append(failure)
-    document["observation_groups"] = cast(list[object], document["observation_groups"])[:1]
-    document["comparisons"] = []
-    _reseal_finding(document)
-    FindingRecord.from_json(records.canonical_bytes(document))
-    failure["diagnostic_kind" if mutation == "diagnostic" else "detail"] = "conflict"
-    _reseal_finding(document)
-    _reject(RecordError, FindingRecord.from_json, records.canonical_bytes(document))

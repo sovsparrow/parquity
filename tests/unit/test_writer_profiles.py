@@ -9,16 +9,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from parquity import writer_profile_contracts as contracts
 from parquity.engines.base import EngineIdentity, EngineWriter, ProviderOperationError
 from parquity.engines.duckdb import DuckDBEngine
 from parquity.engines.fastparquet import FastparquetEngine
 from parquity.engines.polars import PolarsEngine
 from parquity.engines.pyarrow import PyArrowEngine
+from parquity.evidence import EngineVersion
 from parquity.findings.upstream_script import render_upstream_repro
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
-from parquity.writer_profiles import (
+from parquity.profiles import (
     PROFILE_REGISTRY,
     CapabilityStatus,
     WriterExecutionIdentity,
@@ -26,9 +25,10 @@ from parquity.writer_profiles import (
     WriterProfileError,
     WriterProfileIdentity,
     WriterProfilePlan,
-    build_writer_profile_plan,
-    parse_requested_profiles,
+    contracts,
 )
+from parquity.profiles.selection import build_writer_profile_plan, parse_requested_profiles
+from parquity.verdicts import CellResult, MatrixRun, Verdict
 
 Profile = WriterProfileIdentity
 

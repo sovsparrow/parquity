@@ -5,21 +5,27 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from contextlib import ExitStack
-from importlib import metadata
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
+from ..configuration import scan_saved_limit_is_valid, scan_timeout_is_valid
 from ..engines import ReaderSelection
-from ..process import (
+from ..evidence import EngineVersion, EnvironmentEvidence, capture_environment
+from ..evidence.storage import (
+    DestinationExistsError,
+    StagingError,
+    atomic_publish_directory,
+    require_destination_absent,
+    staging_directory,
+)
+from . import bundle, discovery, observations, records
+from .supervision import (
     WorkerLimitError,
     WorkerOutcome,
     WorkerProtocolError,
     WorkerUnavailableError,
     run_worker_process,
 )
-from ..triage.normalization import detail_sha256_v1, normalize_detail_v1
-from ..verdicts import EngineVersion
-from . import bundle, discovery, observations, records, replay_evidence, symptoms
 
 
 class FileEvaluation(NamedTuple):
@@ -28,29 +34,10 @@ class FileEvaluation(NamedTuple):
 
 
 class ScanExecution(NamedTuple):
-    run: records.ScanRunRecord | None
+    run: bundle.ValidatedScanRun | None
     discovery: discovery.Discovery
     evaluated_files: int
-
-    def to_data(self) -> dict[str, object]:
-        data: dict[str, object] = {
-            "status": "AGREEMENT",
-            "discovered_files": len(self.discovery.files),
-            "evaluated_files": self.evaluated_files,
-            "skipped_symlinks": self.discovery.skipped_symlinks,
-            "visited_entries": self.discovery.visited_entries,
-        }
-        if self.run is None:
-            return data
-        record = self.run.data
-        data.update(
-            status="RUN_PUBLISHED",
-            run_status=record["status"],
-            scan_id=record["scan_id"],
-            finding_count=len(cast(list[object], record["findings"])),
-            overflow_count=len(cast(list[object], record["overflow"])),
-        )
-        return data
+    environment: EnvironmentEvidence
 
 
 def evaluate_snapshot(
@@ -64,7 +51,7 @@ def evaluate_snapshot(
     for index, reader in enumerate(selection.readers):
         identity = reader.identity
         worker_directory = private_root / f"worker-{index}"
-        argv = [sys.executable, "-m", "parquity.worker"]
+        argv = [sys.executable, "-m", "parquity.scans.worker"]
         argv += ["--engine", identity.name, "--version", identity.version]
         argv += ["--input", str(snapshot.path), "--out", str(worker_directory)]
         try:
@@ -81,7 +68,7 @@ def evaluate_snapshot(
         except WorkerUnavailableError as error:
             raise discovery.ScanConfigurationError("SCAN_UNAVAILABLE", str(error)) from error
         raw.append(outcome)
-        if outcome.kind == "SUCCESS":
+        if outcome.kind is records.ReaderOutcomeKind.SUCCESS:
             if outcome.artifact is None or outcome.metadata is None:
                 raise WorkerProtocolError("successful worker omitted its observation")
             try:
@@ -104,150 +91,103 @@ def execute_scan(
     selection: ReaderSelection,
     *,
     timeout_seconds: int,
-    max_findings: int,
+    max_saved: int,
+    report_command: str | None = None,
 ) -> ScanExecution:
+    _validate_limits(timeout_seconds, max_saved)
     _ensure_absent(destination)
     inputs = discovery.discover_input(source)
     versions = tuple(EngineVersion(name, version) for name, version in selection.reader_versions)
-    parquity_version = metadata.version("parquity")
+    environment = capture_environment(versions)
     with tempfile.TemporaryDirectory(prefix="parquity-scan-") as raw_private, ExitStack() as stack:
         private_root = Path(raw_private)
         public_root: Path | None = None
         indexes: list[Mapping[str, object]] = []
-        retained_bytes = 0
         evaluated = 0
         for file_index, discovered in enumerate(inputs.files):
             snapshot = discovery.snapshot_file(discovered, private_root / "snapshot")
             evaluation = evaluate_snapshot(snapshot, selection, timeout_seconds, private_root)
             evaluated += 1
             if (
-                any(item.kind != "SUCCESS" for item in evaluation.outcomes)
+                any(
+                    item.kind is not records.ReaderOutcomeKind.SUCCESS
+                    for item in evaluation.outcomes
+                )
                 or len(evaluation.grouped.groups) > 1
             ):
-                retained_bytes += snapshot.byte_count
-                if retained_bytes > records.MAX_RETAINED_INPUT_BYTES:
-                    raise discovery.ScanConfigurationError(
-                        "SCAN_LIMIT_EXCEEDED", "retained scan inputs exceed 512 MiB"
-                    )
                 if public_root is None:
-                    public_root = Path(stack.enter_context(_staging(destination)))
+                    public_root = _open_scan_staging(stack, destination)
                 indexes.append(
                     _materialize_finding(
                         public_root,
                         file_index,
                         snapshot,
-                        parquity_version,
+                        environment,
                         versions,
                         timeout_seconds,
                         evaluation,
                     )
                 )
             shutil.rmtree(snapshot.path.parent)
-            if len(indexes) >= max_findings:
+            if len(indexes) >= max_saved:
                 break
         if not indexes:
-            return ScanExecution(None, inputs, evaluated)
+            return ScanExecution(None, inputs, evaluated, environment)
         overflow = tuple(item.relative_path for item in inputs.files[evaluated:])
         if public_root is None:
             raise RuntimeError("scan finding staging was not initialized")
         public = public_root / "public"
-        run = bundle.build_run(
+        validated = bundle.build_run(
             public,
-            parquity_version=parquity_version,
+            environment=environment,
             input_kind=inputs.input_kind,
             files=tuple((item.relative_path, item.byte_count) for item in inputs.files),
             skipped_symlinks=inputs.skipped_symlinks,
             visited_entries=inputs.visited_entries,
             engines=versions,
             timeout_seconds=timeout_seconds,
-            max_findings=max_findings,
+            max_saved=max_saved,
             findings=tuple(indexes),
             overflow=overflow,
+            report_command=report_command,
         )
         _ensure_absent(destination)
         try:
-            public.rename(destination)
+            atomic_publish_directory(public, destination)
+        except DestinationExistsError as error:
+            raise discovery.ScanConfigurationError(
+                "OUTPUT_EXISTS", "output path already exists"
+            ) from error
         except OSError as error:
             raise discovery.ScanConfigurationError(
                 "OUTPUT_ERROR", "scan output could not be published"
             ) from error
-        return ScanExecution(run, inputs, evaluated)
+        published = bundle.ValidatedScanRun(
+            validated.record,
+            tuple(
+                bundle.ValidatedScanFinding(
+                    child.record,
+                    destination / "findings" / child.record.finding_id,
+                )
+                for child in validated.children
+            ),
+            destination,
+        )
+        return ScanExecution(published, inputs, evaluated, environment)
 
 
-def replay_finding(
-    validated: bundle.ValidatedScanFinding,
-    selection: ReaderSelection,
-) -> Mapping[str, object]:
-    record = validated.record
-    recorded_roster = tuple(item.name for item in record.engines)
-    if selection.reader_names != recorded_roster:
-        raise WorkerProtocolError("scan replay requires the exact recorded reader roster")
-    with tempfile.TemporaryDirectory(prefix="parquity-scan-replay-") as raw_root:
-        root = Path(raw_root)
-        try:
-            source = discovery.discover_input(validated.directory / "input.parquet").files[0]
-            snapshot = discovery.snapshot_file(source, root / "snapshot")
-        except discovery.ScanConfigurationError as error:
-            if error.kind not in ("INVALID_INPUT", "EMPTY_INPUT"):
-                raise
-            raise discovery.ScanConfigurationError(
-                "INPUT_DRIFT", "validated scan input changed before replay"
-            ) from error
-        if snapshot.sha256 != record.input_sha256:
-            raise discovery.ScanConfigurationError(
-                "INPUT_DRIFT", "validated scan input changed before replay"
-            )
-        evaluation = evaluate_snapshot(snapshot, selection, record.timeout_seconds, root)
-    original = symptoms.extract(record, detail_sha256_v1)
-    group_data = tuple(
-        {"id": item.group_id, "engines": list(item.engines)} for item in evaluation.grouped.groups
-    )
-    current = symptoms.extract_evidence(
-        record.finding_id,
-        selection.reader_names,
-        record.timeout_seconds,
-        tuple(item.to_data() for item in evaluation.outcomes),
-        group_data,
-        tuple(item.to_data() for item in evaluation.grouped.differences),
-        detail_sha256_v1,
-    )
-    comparison = replay_evidence.compare(original, current, normalize_detail_v1)
-    current_versions = dict(selection.reader_versions)
-    versions = tuple(
-        {
-            "engine": item.name,
-            "original": item.version,
-            "current": current_versions[item.name],
-            "drift": item.version != current_versions[item.name],
-        }
-        for item in record.engines
-    )
-    return {
-        "finding_id": record.finding_id,
-        "classification": comparison.classification,
-        "package_version": {
-            "original": record.parquity_version,
-            "current": metadata.version("parquity"),
-            "drift": record.parquity_version != metadata.version("parquity"),
-        },
-        "version_evidence": list(versions),
-        "occurrence_results": list(comparison.occurrence_results),
-        "new_observations": list(comparison.new_observations),
-    }
-
-
-def replay_run(
-    validated: bundle.ValidatedScanRun,
-    selection: ReaderSelection,
-) -> tuple[Mapping[str, object], ...]:
-    return tuple(replay_finding(child, selection) for child in validated.children)
+def _validate_limits(timeout_seconds: object, max_saved: object) -> None:
+    if not scan_timeout_is_valid(timeout_seconds):
+        raise ValueError("worker timeout must be in [1, 300]")
+    if not scan_saved_limit_is_valid(max_saved):
+        raise ValueError("scan saved-evidence limit must be in [1, 64]")
 
 
 def _materialize_finding(
     root: Path,
     index: int,
     snapshot: discovery.Snapshot,
-    parquity_version: str,
+    environment: EnvironmentEvidence,
     versions: tuple[EngineVersion, ...],
     timeout: int,
     evaluation: FileEvaluation,
@@ -256,7 +196,7 @@ def _materialize_finding(
     pending = children / f".pending-{index}"
     record = bundle.build_finding(
         pending,
-        parquity_version=parquity_version,
+        environment=environment,
         source_path=snapshot.relative_path,
         input_payload=snapshot.path.read_bytes(),
         engines=versions,
@@ -296,23 +236,21 @@ def _outcome_record(outcome: WorkerOutcome, group_id: str | None) -> records.Rea
 
 def _ensure_absent(destination: Path) -> None:
     try:
-        destination.lstat()
-    except FileNotFoundError:
-        return
+        require_destination_absent(destination)
+    except DestinationExistsError as error:
+        raise discovery.ScanConfigurationError(
+            "OUTPUT_EXISTS", "output path already exists"
+        ) from error
     except OSError as error:
         raise discovery.ScanConfigurationError(
             "OUTPUT_ERROR", "output path could not be inspected"
         ) from error
-    raise discovery.ScanConfigurationError("OUTPUT_EXISTS", "output path already exists")
 
 
-def _staging(destination: Path) -> tempfile.TemporaryDirectory[str]:
+def _open_scan_staging(stack: ExitStack, destination: Path) -> Path:
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        return tempfile.TemporaryDirectory(
-            prefix=f".{destination.name}.parquity-scan-", dir=destination.parent
-        )
-    except OSError as error:
+        return stack.enter_context(staging_directory(destination, suffix="-scan"))
+    except StagingError as error:
         raise discovery.ScanConfigurationError(
             "OUTPUT_ERROR", "output path could not be prepared"
         ) from error

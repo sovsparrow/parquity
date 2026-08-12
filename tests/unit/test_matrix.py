@@ -12,14 +12,14 @@ import pytest
 from parquity.engines.base import EngineIdentity, ProviderOperationError
 from parquity.matrix import run_matrix
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.verdicts import Verdict
-from parquity.writer_profile_contracts import (
+from parquity.profiles import WriterProfileIdentity
+from parquity.profiles.contracts import (
     CONTRACT_VIOLATION,
     ArtifactContractObservation,
     WriterProfileContractViolation,
     verify_writer_profile_artifact,
 )
-from parquity.writer_profiles import WriterProfileIdentity
+from parquity.verdicts import Verdict
 
 Write = Callable[[pa.Table, Path], None]
 Read = Callable[[Path], pa.Table]
@@ -295,12 +295,10 @@ def test_artifact_contract_verifier_marks_empty_rows_non_observable_and_rejects_
     wrong_compression = tmp_path / "wrong-compression.parquet"
     wrong_groups = tmp_path / "wrong-groups.parquet"
     present_min_max = tmp_path / "present-min-max.parquet"
-    good_gzip = tmp_path / "good-gzip.parquet"
     empty = tmp_path / "empty.parquet"
     _PARQUET.write_table(table, wrong_compression)
     _PARQUET.write_table(table, wrong_groups, row_group_size=3)
     _PARQUET.write_table(table, present_min_max, write_statistics=True)
-    _PARQUET.write_table(table, good_gzip, compression="gzip")
     _PARQUET.write_table(
         pa.table({"value": pa.array([], type=pa.int32())}), empty, row_group_size=2
     )
@@ -322,12 +320,19 @@ def test_artifact_contract_verifier_marks_empty_rows_non_observable_and_rejects_
             verify_writer_profile_artifact(path, profile, 4)
         assert captured.value.kind == CONTRACT_VIOLATION
 
-    assert (
-        verify_writer_profile_artifact(
-            good_gzip, WriterProfileIdentity("compression-gzip", {"compression": "gzip"}), 4
-        )
-        is ArtifactContractObservation.VERIFIED
+    valid = (
+        ("compression-gzip", {"compression": "gzip"}),
+        ("compression-brotli", {"compression": "brotli"}),
+        ("row-group-2", {"row_group_size": 2}),
+        ("min-max-statistics-off", {"write_statistics": False}),
     )
+    for name, options in valid:
+        path = tmp_path / f"good-{name}.parquet"
+        _PARQUET.write_table(table, path, **options)
+        assert (
+            verify_writer_profile_artifact(path, WriterProfileIdentity(name, options), 4)
+            is ArtifactContractObservation.VERIFIED
+        )
     empty_profiles = (
         WriterProfileIdentity("compression-gzip", {"compression": "gzip"}),
         WriterProfileIdentity("row-group-2", {"row_group_size": 2}),
@@ -339,4 +344,6 @@ def test_artifact_contract_verifier_marks_empty_rows_non_observable_and_rejects_
             is ArtifactContractObservation.NOT_OBSERVABLE_EMPTY
         )
     with pytest.raises(WriterProfileContractViolation):
-        verify_writer_profile_artifact(good_gzip, empty_profiles[0], 0)
+        verify_writer_profile_artifact(
+            tmp_path / "good-compression-gzip.parquet", empty_profiles[0], 0
+        )

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
-import json
 import math
 import re
 import struct
@@ -10,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import cast
 
+from ..evidence import json_codec
 from .types import Kind, TypeSpec
 
 _INT32 = (-(2**31), 2**31 - 1)
@@ -35,10 +34,6 @@ def normalize_value(spec: TypeSpec, nullable: bool, value: object, path: str) ->
     if spec.kind is Kind.STRUCT:
         return _normalize_struct(spec, value, path)
     return _normalize_map(spec, value, path)
-
-
-def validate_value(spec: TypeSpec, nullable: bool, value: object, path: str) -> None:
-    normalize_value(spec, nullable, value, path)
 
 
 def normalize_float(kind: Kind, value: object, path: str) -> float:
@@ -100,47 +95,19 @@ def semantic_key_bytes(spec: TypeSpec, value: object) -> bytes:
     return normalized_key_bytes(spec, normalized)
 
 
-def semantic_key_digest(spec: TypeSpec, value: object) -> str:
-    return hashlib.sha256(semantic_key_bytes(spec, value)).hexdigest()
-
-
 def normalized_key_bytes(spec: TypeSpec, value: object) -> bytes:
     document = {"type": spec.to_data(), "value": _semantic_value(spec, value)}
-    return json.dumps(
-        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode()
+    return json_codec.canonical_bytes(document)
 
 
 def map_entries(value: object, path: str) -> list[Sequence[object]]:
     entries: list[Sequence[object]] = []
-    for entry in sequence(value, path):
-        pair = sequence(entry, "map entry")
+    for entry in json_codec.sequence(value, path):
+        pair = json_codec.sequence(entry, "map entry")
         if len(pair) != 2:
             raise ValueError(f"{path} map entries must contain two items")
         entries.append(pair)
     return entries
-
-
-def mapping(value: object, label: str) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{label} must be an object")
-    raw = cast(Mapping[object, object], value)
-    if any(not isinstance(key, str) for key in raw):
-        raise ValueError(f"{label} must be an object")
-    return cast(Mapping[str, object], raw)
-
-
-def sequence(value: object, label: str) -> Sequence[object]:
-    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
-        raise ValueError(f"{label} must be an array")
-    return cast(Sequence[object], value)
-
-
-def string(value: object, label: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{label} must be a string")
-    _utf8(value, label)
-    return value
 
 
 def _normalize_scalar(spec: TypeSpec, value: object, path: str) -> object:
@@ -155,7 +122,7 @@ def _normalize_scalar(spec: TypeSpec, value: object, path: str) -> object:
     if spec.kind is Kind.STRING:
         if not isinstance(value, str):
             raise ValueError(f"{path} requires string")
-        _utf8(value, path)
+        json_codec.string(value, path)
         return value
     if spec.kind is Kind.BINARY:
         if not isinstance(value, bytes):
@@ -167,7 +134,7 @@ def _normalize_scalar(spec: TypeSpec, value: object, path: str) -> object:
 
 
 def _normalize_list(spec: TypeSpec, value: object, path: str) -> list[object]:
-    items = sequence(value, path)
+    items = json_codec.sequence(value, path)
     if spec.size is not None and len(items) != spec.size:
         raise ValueError(f"{path} requires exactly {spec.size} items")
     item_spec = cast(TypeSpec, spec.item)
@@ -178,7 +145,7 @@ def _normalize_list(spec: TypeSpec, value: object, path: str) -> list[object]:
 
 
 def _normalize_struct(spec: TypeSpec, value: object, path: str) -> dict[str, object]:
-    data = mapping(value, path)
+    data = json_codec.mapping(value, path)
     expected = {field.name for field in spec.fields}
     if set(data) != expected:
         raise ValueError(f"{path} has incorrect struct fields")
@@ -222,9 +189,9 @@ def _semantic_value(spec: TypeSpec, value: object) -> object:
         return {"$binary": base64.b64encode(cast(bytes, value)).decode("ascii")}
     if spec.kind in (Kind.LIST, Kind.FIXED_LIST):
         item = cast(TypeSpec, spec.item)
-        return [_semantic_value(item, child) for child in sequence(value, "list")]
+        return [_semantic_value(item, child) for child in json_codec.sequence(value, "list")]
     if spec.kind is Kind.STRUCT:
-        data = mapping(value, "struct")
+        data = json_codec.mapping(value, "struct")
         return {
             field.name: _semantic_value(field.type_spec, data[field.name]) for field in spec.fields
         }
@@ -258,18 +225,103 @@ def _coefficient_text(coefficient: int, scale: int) -> str:
     return f"{sign}{padded[:-scale]}.{padded[-scale:]}"
 
 
-def _utf8(value: str, label: str) -> None:
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise ValueError(f"{label} must be valid UTF-8 text") from error
+def encode_value(spec: TypeSpec, value: object) -> object:
+    if value is None:
+        return None
+    if spec.kind is Kind.BINARY:
+        return {"$binary": base64.b64encode(cast(bytes, value)).decode("ascii")}
+    if spec.kind in (Kind.FLOAT32, Kind.FLOAT64):
+        number = cast(float, value)
+        if math.isnan(number):
+            return {"$float": "nan"}
+        if math.isinf(number):
+            return {"$float": "inf" if number > 0 else "-inf"}
+        return number
+    if spec.kind is Kind.DECIMAL128:
+        return {"$decimal": decimal_text(spec, cast(Decimal, value), "decimal")}
+    if spec.kind in (Kind.LIST, Kind.FIXED_LIST):
+        item = cast(TypeSpec, spec.item)
+        return [encode_value(item, child) for child in json_codec.sequence(value, "list")]
+    if spec.kind is Kind.STRUCT:
+        data = json_codec.mapping(value, "struct")
+        return {
+            field.name: encode_value(field.type_spec, data[field.name]) for field in spec.fields
+        }
+    if spec.kind is Kind.MAP:
+        key_spec = cast(TypeSpec, spec.key)
+        value_spec = cast(TypeSpec, spec.value)
+        return [
+            [encode_value(key_spec, entry[0]), encode_value(value_spec, entry[1])]
+            for entry in map_entries(value, "map")
+        ]
+    return value
+
+
+def decode_value(spec: TypeSpec, value: object) -> object:
+    if value is None:
+        return None
+    tagged = _decode_tagged(spec, value)
+    if tagged is not _CONTAINER:
+        return tagged
+    if spec.kind in (Kind.LIST, Kind.FIXED_LIST):
+        item = cast(TypeSpec, spec.item)
+        return [decode_value(item, child) for child in json_codec.sequence(value, "list")]
+    if spec.kind is Kind.STRUCT:
+        data = json_codec.mapping(value, "struct")
+        expected = {field.name for field in spec.fields}
+        if set(data) != expected:
+            raise ValueError("struct has incorrect fields")
+        return {
+            field.name: decode_value(field.type_spec, data[field.name]) for field in spec.fields
+        }
+    if spec.kind is Kind.MAP:
+        key_spec = cast(TypeSpec, spec.key)
+        value_spec = cast(TypeSpec, spec.value)
+        return [
+            [decode_value(key_spec, entry[0]), decode_value(value_spec, entry[1])]
+            for entry in map_entries(value, "map")
+        ]
+    return value
+
+
+def _decode_tagged(spec: TypeSpec, value: object) -> object:
+    if spec.kind is Kind.BINARY:
+        data = _tag(value, "$binary")
+        encoded = json_codec.string(data["$binary"], "$binary")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as error:
+            raise ValueError("binary tag is malformed") from error
+        if base64.b64encode(decoded).decode("ascii") != encoded:
+            raise ValueError("binary tag is not canonical")
+        return decoded
+    if spec.kind in (Kind.FLOAT32, Kind.FLOAT64):
+        if isinstance(value, Mapping):
+            data = _tag(cast(object, value), "$float")
+            token = json_codec.string(data["$float"], "$float")
+            values = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
+            if token not in values:
+                raise ValueError("float tag is malformed")
+            return values[token]
+        return normalize_float(spec.kind, value, "float")
+    if spec.kind is Kind.DECIMAL128:
+        data = _tag(value, "$decimal")
+        return decimal_from_text(spec, json_codec.string(data["$decimal"], "$decimal"))
+    return _CONTAINER
+
+
+def _tag(value: object, name: str) -> Mapping[str, object]:
+    data = json_codec.mapping(value, name)
+    if set(data) != {name}:
+        raise ValueError(f"{name} tag is malformed")
+    return data
 
 
 __all__ = [
     "decimal_from_coefficient",
+    "decode_value",
+    "encode_value",
     "float_bits",
     "normalize_value",
     "semantic_key_bytes",
-    "semantic_key_digest",
-    "validate_value",
 ]

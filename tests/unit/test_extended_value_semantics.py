@@ -9,13 +9,12 @@ from typing import cast
 import pyarrow as pa
 import pytest
 
-from parquity.arrow_bridge import arrow_to_rows, case_to_arrow
-from parquity.case import semantic_key_bytes, semantic_key_digest, validate_value
-from parquity.compare import compare_case
-from parquity.comparison_values import value_mismatch
+from parquity.case import semantic_key_bytes
+from parquity.case.arrow import arrow_to_rows, case_to_arrow
+from parquity.comparison.table import compare_case
+from parquity.comparison.values import value_mismatch
 from parquity.findings.upstream_script import render_upstream_repro
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.triage.normalization import normalize_generated_path, type_shape
 from parquity.verdicts import CellResult, Verdict
 
 
@@ -198,8 +197,6 @@ def test_recursive_semantic_key_identity_covers_every_container_value_family() -
     }
     right = {**left, "lookup": [["a", -0.0], ["b", float("nan")]]}
     assert semantic_key_bytes(key, left) == semantic_key_bytes(key, right)
-    assert len(semantic_key_digest(key, left)) == 64
-    validate_value(key, False, left, "key")
 
 
 def test_recursive_comparison_rejects_malformed_observations_at_typed_paths() -> None:
@@ -236,8 +233,7 @@ def test_recursive_comparison_rejects_malformed_observations_at_typed_paths() ->
     assert_mismatch(map_spec, [["a", 1]], [])
 
 
-def test_extended_paths_and_upstream_source_preserve_typed_identity() -> None:
-    digest = "a" * 64
+def test_extended_upstream_source_preserves_typed_identity() -> None:
     value = TypeSpec(
         Kind.STRUCT,
         fields=(
@@ -270,14 +266,6 @@ def test_extended_paths_and_upstream_source_preserve_typed_identity() -> None:
         fields,
         ((0, Decimal("1.20"), [["a", {"ticks": [-1]}]], float("inf"), -float("inf"), None),),
     )
-    normalized = normalize_generated_path(
-        f"$rows[3].lookup.entries[sha256={digest}].value.ticks[0]", case
-    )
-    assert isinstance(normalized, dict)
-    assert normalized["row"] == "*"
-    assert type_shape(lookup)["kind"] == "map"
-    assert type_shape(fields[1].type_spec) == {"kind": "decimal128", "precision": 4, "scale": 2}
-
     target = CellResult(
         "pyarrow", "1", "pyarrow", "1", "compare", Verdict.VALUE_MISMATCH, "$", "controlled"
     )
@@ -296,31 +284,6 @@ def test_arrow_observation_rejects_a_conflicting_field_roster() -> None:
     assert arrow_to_rows(table, case.fields) == ((1,),)
     with pytest.raises(ValueError, match="field count"):
         arrow_to_rows(table, ())
-
-
-def test_generated_path_normalization_covers_schema_container_and_map_boundaries() -> None:
-    digest = "b" * 64
-    item = TypeSpec(
-        Kind.STRUCT,
-        fields=(Field("amount", TypeSpec(Kind.DECIMAL128, precision=4, scale=2), False),),
-    )
-    mapping = TypeSpec(
-        Kind.MAP,
-        key=TypeSpec(Kind.STRING),
-        value=TypeSpec(Kind.LIST, item=item, item_nullable=False),
-        value_nullable=False,
-    )
-    case = Case((Field("lookup", mapping, False),), (([["x", [{"amount": Decimal("1.20")}]]],),))
-    paths = (
-        "$rows[0][0]",
-        "$schema.lookup.entries[sha256=" + digest + "]",
-        "$schema.lookup.entries[sha256=" + digest + "].value[].amount",
-        "$rows[1].lookup.entries[sha256=" + digest + "].value[0].unknown",
-        "$rows[1].lookup.not-an-entry",
-    )
-    normalized = [normalize_generated_path(path, case) for path in paths]
-    assert normalized[0] == "$rows[*][0]"
-    assert all(item is not None for item in normalized)
 
 
 @pytest.mark.parametrize(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,15 +46,24 @@ def _install_factory(
 ) -> None:
     provider = ModuleType(descriptor.import_name)
     adapter = ModuleType(descriptor.adapter_module)
-
-    def installed_version(distribution: str) -> str:
-        assert distribution == descriptor.distribution
-        return "1.0"
-
     monkeypatch.setattr(adapter, "create_engine", factory, raising=False)
-    monkeypatch.setattr(registry.metadata, "version", installed_version)
+    _install_version(monkeypatch, descriptor)
     monkeypatch.setitem(sys.modules, descriptor.import_name, provider)
     monkeypatch.setitem(sys.modules, descriptor.adapter_module, adapter)
+
+
+def _install_version(
+    monkeypatch: pytest.MonkeyPatch, descriptor: EngineDescriptor, version: str = "1.0"
+) -> None:
+    def installed(distribution: str) -> str:
+        assert distribution == descriptor.distribution
+        return version
+
+    monkeypatch.setattr(registry.metadata, "version", installed)
+
+
+def _missing_version(distribution: str) -> str:
+    raise metadata.PackageNotFoundError(distribution)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +97,7 @@ def test_discovery_reads_metadata_and_directions_without_importing_implementatio
     monkeypatch.setattr(registry.metadata, "version", synthetic_version)
     assert descriptor.import_name not in sys.modules
     assert descriptor.adapter_module not in sys.modules
-
     availability = registry.discover_engines((descriptor,))[0]
-
     assert descriptor.import_name not in sys.modules
     assert descriptor.adapter_module not in sys.modules
     assert availability.available
@@ -103,20 +111,15 @@ def test_missing_distribution_returns_declared_unavailable_evidence_with_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     descriptor = _descriptor("missing", writer=False)
-
-    def missing_version(distribution: str) -> str:
-        raise metadata.PackageNotFoundError(distribution)
-
-    monkeypatch.setattr(registry.metadata, "version", missing_version)
-
+    monkeypatch.setattr(registry.metadata, "version", _missing_version)
     resolution = registry.resolve_engine(descriptor.name, (descriptor,))
-
-    assert resolution.reader is None
-    assert resolution.writer is None
-    assert not resolution.availability.available
-    assert resolution.availability.version is None
-    assert resolution.availability.reader
-    assert not resolution.availability.writer
+    assert (resolution.reader, resolution.writer) == (None, None)
+    assert (
+        resolution.availability.available,
+        resolution.availability.version,
+        resolution.availability.reader,
+        resolution.availability.writer,
+    ) == (False, None, True, False)
     assert resolution.availability.installation_hint == "install missing"
 
 
@@ -125,14 +128,8 @@ def test_missing_provider_import_returns_unavailable_evidence_with_hint(
 ) -> None:
     descriptor = _descriptor("provider_that_does_not_exist_for_parquity")
 
-    def installed_version(distribution: str) -> str:
-        assert distribution == descriptor.distribution
-        return "1.0"
-
-    monkeypatch.setattr(registry.metadata, "version", installed_version)
-
+    _install_version(monkeypatch, descriptor)
     resolution = registry.resolve_engine(descriptor.name, (descriptor,))
-
     assert resolution.reader is None
     assert resolution.writer is None
     assert not resolution.availability.available
@@ -145,17 +142,12 @@ def test_provider_import_missing_nested_dependency_propagates(
 ) -> None:
     descriptor = _descriptor("nested_import_failure")
 
-    def installed_version(distribution: str) -> str:
-        assert distribution == descriptor.distribution
-        return "1.0"
-
     def import_with_nested_failure(name: str) -> ModuleType:
         del name
         raise ModuleNotFoundError(name="nested_provider_dependency")
 
-    monkeypatch.setattr(registry.metadata, "version", installed_version)
+    _install_version(monkeypatch, descriptor)
     monkeypatch.setattr(registry, "import_module", import_with_nested_failure)
-
     with pytest.raises(ModuleNotFoundError):
         registry.resolve_engine(descriptor.name, (descriptor,))
 
@@ -175,11 +167,7 @@ def test_unexpected_metadata_and_internal_adapter_failures_propagate(
 
     adapter_descriptor = _descriptor("missing_adapter")
 
-    def installed_version(distribution: str) -> str:
-        assert distribution == adapter_descriptor.distribution
-        return "1.0"
-
-    monkeypatch.setattr(registry.metadata, "version", installed_version)
+    _install_version(monkeypatch, adapter_descriptor)
     monkeypatch.setitem(
         sys.modules,
         adapter_descriptor.import_name,
@@ -196,12 +184,8 @@ def test_non_callable_and_failing_adapter_factories_propagate(
     provider = ModuleType(non_callable.import_name)
     adapter = ModuleType(non_callable.adapter_module)
 
-    def installed_version(distribution: str) -> str:
-        assert distribution == non_callable.distribution
-        return "1.0"
-
     monkeypatch.setattr(adapter, "create_engine", object(), raising=False)
-    monkeypatch.setattr(registry.metadata, "version", installed_version)
+    _install_version(monkeypatch, non_callable)
     monkeypatch.setitem(sys.modules, non_callable.import_name, provider)
     monkeypatch.setitem(sys.modules, non_callable.adapter_module, adapter)
     with pytest.raises(TypeError):
@@ -227,9 +211,7 @@ def test_reader_only_resolution_exposes_no_fake_writer(
         return _Reader(EngineIdentity(descriptor.name, version))
 
     _install_factory(monkeypatch, descriptor, create_engine)
-
     resolution = registry.resolve_engine(descriptor.name, (descriptor,))
-
     assert resolution.reader is not None
     assert resolution.reader.identity == EngineIdentity(descriptor.name, "1.0")
     assert resolution.writer is None
@@ -244,11 +226,9 @@ def test_reader_writer_resolution_shares_one_immutable_identity(
         return _ReaderWriter(EngineIdentity(descriptor.name, version))
 
     _install_factory(monkeypatch, descriptor, create_engine)
-
     resolution = registry.resolve_engine(descriptor.name, (descriptor,))
 
-    assert resolution.reader is not None
-    assert resolution.writer is not None
+    assert resolution.reader is not None and resolution.writer is not None
     assert resolution.reader.identity is resolution.writer.identity
 
 
@@ -292,21 +272,13 @@ def test_resolution_refuses_inconsistent_shared_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     descriptor = _descriptor("expected")
-    conflicts = iter(
-        (
-            _ReaderWriter(EngineIdentity("other", "1.0")),
-            _ReaderWriter(EngineIdentity(descriptor.name, "2.0")),
-        )
-    )
 
     def create_engine(version: str) -> object:
         del version
-        return next(conflicts)
+        return _ReaderWriter(EngineIdentity("other", "1.0"))
 
     _install_factory(monkeypatch, descriptor, create_engine)
 
-    with pytest.raises(TypeError):
-        registry.resolve_engine(descriptor.name, (descriptor,))
     with pytest.raises(TypeError):
         registry.resolve_engine(descriptor.name, (descriptor,))
 
@@ -320,12 +292,12 @@ def test_descriptors_refuse_invalid_tiers_and_directionless_declarations() -> No
 
 def test_unknown_engine_resolution_is_a_structured_configuration_error() -> None:
     descriptor = _descriptor("known")
-
     resolution = registry.resolve_engine("unknown", (descriptor,))
-
-    assert resolution.reader is None
-    assert resolution.writer is None
-    assert not resolution.availability.available
+    assert (resolution.reader, resolution.writer, resolution.availability.available) == (
+        None,
+        None,
+        False,
+    )
     assert resolution.availability.tier == "unregistered"
     assert resolution.availability.installation_hint == "Choose a registered engine: known"
 
@@ -339,12 +311,16 @@ def test_reader_selection_rejects_invalid_capability_and_availability(
     assert capability.value.kind == "ENGINE_CAPABILITY_ERROR"
 
     missing = _descriptor("missing", tier="core", writer=False)
-
-    def missing_version(distribution: str) -> str:
-        raise metadata.PackageNotFoundError(distribution)
-
-    monkeypatch.setattr(registry.metadata, "version", missing_version)
+    monkeypatch.setattr(registry.metadata, "version", _missing_version)
     with pytest.raises(registry.EngineSelectionError) as unavailable:
         registry.resolve_reader_selection(None, (missing,))
     assert unavailable.value.kind == "ENGINE_UNAVAILABLE"
     assert unavailable.value.unavailable[0].installation_hint == "install missing"
+
+
+def test_core_imports_do_not_require_the_optional_fastparquet_provider() -> None:
+    probe = "import sys; sys.modules['fastparquet'] = None; import parquity.findings.bundle; import parquity.runs.replay; import parquity.cli.main"
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and literal import probe.
+        [sys.executable, "-c", probe], check=False, capture_output=True, text=True
+    )
+    assert (completed.returncode, completed.stderr) == (0, "")

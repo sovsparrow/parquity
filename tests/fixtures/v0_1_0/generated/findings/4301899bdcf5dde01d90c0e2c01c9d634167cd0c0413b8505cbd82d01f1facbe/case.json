@@ -1,0 +1,1 @@
+{"format":"parquity.case.v1","rows":[[1]],"schema":[{"name":"value","nullable":false,"type":{"kind":"int32"}}]}

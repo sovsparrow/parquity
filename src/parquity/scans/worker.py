@@ -3,10 +3,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from .engines import resolve_engine
-from .engines.base import ProviderOperationError
-from .process import WorkerControl
-from .scans.observations import ObservationError, encode_observation
+from ..engines import resolve_engine
+from ..engines.base import ProviderOperationError
+from ..evidence import bounded_detail
+from .control import CONTROL_NAME, WorkerControl
+from .observations import ObservationError, encode_observation
 
 
 def main() -> int:
@@ -26,15 +27,21 @@ def main() -> int:
         except ProviderOperationError as error:
             if error.engine != engine or error.operation != "read":
                 raise RuntimeError("provider error ownership conflicts with the request") from error
-            return _error("PROVIDER_ERROR", engine, version, error.provider_type, error.detail)
+            return _error(
+                directory,
+                "PROVIDER_ERROR",
+                engine,
+                version,
+                error.provider_type,
+                error.detail,
+            )
         payload, metadata = encode_observation(table)
         (directory / "observation.arrow").write_bytes(payload)
-        return _emit(WorkerControl("SUCCESS", engine, version, metadata, "SUCCESS", ""))
+        return _emit(directory, WorkerControl("SUCCESS", engine, version, metadata, "SUCCESS", ""))
     except ObservationError as error:
-        return _error("LIMIT_ERROR", engine, version, type(error).__name__, str(error))
+        return _error(directory, "LIMIT_ERROR", engine, version, type(error).__name__, error)
     except Exception as error:  # noqa: BLE001 - child reports unexpected failures to its parent.
-        detail = " ".join(str(error).split())[:500]
-        return _error("INTERNAL_ERROR", engine, version, type(error).__name__, detail)
+        return _error(directory, "INTERNAL_ERROR", engine, version, type(error).__name__, error)
 
 
 def _arguments(arguments: tuple[str, ...]) -> tuple[str, str, Path, Path]:
@@ -46,14 +53,24 @@ def _arguments(arguments: tuple[str, ...]) -> tuple[str, str, Path, Path]:
     return engine, version, Path(source), Path(directory)
 
 
-def _emit(control: WorkerControl) -> int:
-    sys.stdout.buffer.write(control.canonical_bytes() + b"\n")
-    sys.stdout.buffer.flush()
+def _emit(directory: Path, control: WorkerControl) -> int:
+    with (directory / CONTROL_NAME).open("xb") as stream:
+        stream.write(control.canonical_bytes())
     return 0
 
 
-def _error(outcome: str, engine: str, version: str, kind: str, detail: str) -> int:
-    return _emit(WorkerControl(outcome, engine, version, None, kind, detail))
+def _error(
+    directory: Path,
+    outcome: str,
+    engine: str,
+    version: str,
+    kind: str,
+    detail: object,
+) -> int:
+    return _emit(
+        directory,
+        WorkerControl(outcome, engine, version, None, kind, bounded_detail(detail)),
+    )
 
 
 if __name__ == "__main__":

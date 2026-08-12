@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import signal
@@ -8,21 +7,26 @@ import stat
 import subprocess
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, NamedTuple, cast
 
-from .findings import json_codec as codec
-from .scans.observations import MAX_OBSERVATION_BYTES, ObservationMetadata
-from .scans.records import canonical_bytes
+from ..configuration import scan_timeout_is_valid
+from ..evidence import digest_matches
+from .control import (
+    ARTIFACT_NAME,
+    CONTROL_NAME,
+    MAX_CONTROL_BYTES,
+    WorkerControl,
+    WorkerProtocolError,
+)
+from .limits import MAX_OBSERVATION_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES
+from .observations import ObservationMetadata
+from .records import ReaderOutcomeKind
 
-MAX_STDOUT_BYTES, MAX_STDERR_BYTES = 16 * 1024, 64 * 1024
 TERMINATION_GRACE_SECONDS = 1.0
-WORKER_CONTROL_FORMAT = "parquity.worker-control.v1"
-ARTIFACT_NAME = "observation.arrow"
-_CONTROL_KEYS = "format outcome engine engine_version artifact artifact_bytes artifact_sha256 row_count column_count schema_sha256 diagnostic_kind detail"
 
 
 class WorkerInternalError(RuntimeError): ...
@@ -31,76 +35,11 @@ class WorkerInternalError(RuntimeError): ...
 class WorkerLimitError(ValueError): ...
 
 
-class WorkerProtocolError(RuntimeError): ...
-
-
 class WorkerUnavailableError(RuntimeError): ...
 
 
-class WorkerControl(NamedTuple):
-    outcome: str
-    engine: str
-    engine_version: str
-    metadata: ObservationMetadata | None
-    diagnostic_kind: str
-    detail: str
-
-    def to_data(self) -> dict[str, object]:
-        metadata = self.metadata
-        return {
-            "format": WORKER_CONTROL_FORMAT,
-            "outcome": self.outcome,
-            "engine": self.engine,
-            "engine_version": self.engine_version,
-            "artifact": ARTIFACT_NAME if metadata is not None else None,
-            "artifact_bytes": None if metadata is None else metadata.byte_count,
-            "artifact_sha256": None if metadata is None else metadata.sha256,
-            "row_count": None if metadata is None else metadata.row_count,
-            "column_count": None if metadata is None else metadata.column_count,
-            "schema_sha256": None if metadata is None else metadata.schema_sha256,
-            "diagnostic_kind": self.diagnostic_kind,
-            "detail": self.detail,
-        }
-
-    def canonical_bytes(self) -> bytes:
-        return canonical_bytes(self.to_data())
-
-    @classmethod
-    def from_json(cls, payload: bytes) -> WorkerControl:
-        try:
-            decoded = codec.decode(payload)
-            data = codec.mapping(decoded, "worker control")
-            if set(data) != set(_CONTROL_KEYS.split()) or data["format"] != WORKER_CONTROL_FORMAT:
-                raise WorkerProtocolError("worker control fields are malformed")
-            metadata = _control_metadata(data)
-            if data["artifact"] != (ARTIFACT_NAME if metadata is not None else None):
-                raise WorkerProtocolError("worker artifact evidence is malformed")
-            control = cls(
-                codec.string(data["outcome"], "outcome"),
-                codec.string(data["engine"], "engine"),
-                codec.string(data["engine_version"], "engine version"),
-                metadata,
-                codec.string(data["diagnostic_kind"], "diagnostic kind"),
-                codec.string(data["detail"], "detail"),
-            )
-            allowed = ("SUCCESS", "PROVIDER_ERROR", "LIMIT_ERROR", "INTERNAL_ERROR")
-            if (
-                control.outcome not in allowed
-                or not all((control.engine, control.engine_version, control.diagnostic_kind))
-                or (control.outcome == "SUCCESS") != (metadata is not None)
-            ):
-                raise WorkerProtocolError("worker control identity is malformed")
-        except WorkerProtocolError:
-            raise
-        except (KeyError, TypeError, ValueError) as error:
-            raise WorkerProtocolError("worker control is malformed") from error
-        if control.canonical_bytes() != payload:
-            raise WorkerProtocolError("worker control is not canonical")
-        return control
-
-
 class WorkerOutcome(NamedTuple):
-    kind: str
+    kind: ReaderOutcomeKind
     engine: str
     engine_version: str
     diagnostic_kind: str
@@ -141,7 +80,7 @@ def run_worker_process(
     timeout_seconds: int,
     owned_root: Path | None = None,
 ) -> WorkerOutcome:
-    if not 1 <= timeout_seconds <= 300:
+    if not scan_timeout_is_valid(timeout_seconds):
         raise ValueError("worker timeout must be in [1, 300]")
     if os.name != "posix" or not hasattr(os, "killpg"):
         raise WorkerUnavailableError("worker process-group isolation is unavailable")
@@ -199,13 +138,21 @@ def _execute(
     retained_stderr = encoded_stderr[:MAX_STDERR_BYTES].decode("utf-8", errors="ignore")
     stderr_truncated = stderr.truncated or len(encoded_stderr) > MAX_STDERR_BYTES
     if timed_out or return_code:
-        if not timed_out and stdout.payload:
-            _read_control(stdout, engine, version)
+        if not timed_out and _control_present(private_directory):
+            _read_control(private_directory, engine, version)
             raise WorkerProtocolError("worker control record conflicts with its exit status")
-        kind = "TIMEOUT" if timed_out else "PROCESS_CRASH"
-        values = (kind, engine, version, kind, retained_stderr, retained_stderr, stderr_truncated)
+        kind = ReaderOutcomeKind.TIMEOUT if timed_out else ReaderOutcomeKind.PROCESS_ERROR
+        values = (
+            kind,
+            engine,
+            version,
+            kind.value,
+            retained_stderr,
+            retained_stderr,
+            stderr_truncated,
+        )
         return WorkerOutcome(*values, terminated=terminated, killed=killed)
-    control = _read_control(stdout, engine, version)
+    control = _read_control(private_directory, engine, version)
     detail = _normalize(control.detail.encode(), owned_root)
     failures = {
         "INTERNAL_ERROR": WorkerInternalError(f"{control.diagnostic_kind}: {detail}"),
@@ -215,20 +162,46 @@ def _execute(
         raise failure
     if control.outcome == "PROVIDER_ERROR":
         _require_inventory(private_directory, set())
-        values = (control.outcome, engine, version, control.diagnostic_kind, detail)
+        values = (
+            ReaderOutcomeKind.PROVIDER_ERROR,
+            engine,
+            version,
+            control.diagnostic_kind,
+            detail,
+        )
         return WorkerOutcome(*values, retained_stderr, stderr_truncated)
     artifact = _validated_artifact(private_directory, cast(ObservationMetadata, control.metadata))
-    values = (control.outcome, engine, version, control.diagnostic_kind, detail)
+    values = (ReaderOutcomeKind.SUCCESS, engine, version, control.diagnostic_kind, detail)
     return WorkerOutcome(*values, retained_stderr, stderr_truncated, artifact, control.metadata)
 
 
-def _read_control(stdout: _Capture, engine: str, version: str) -> WorkerControl:
-    if stdout.truncated:
-        raise WorkerProtocolError("worker stdout exceeds 16 KiB")
-    raw = bytes(stdout.payload)
-    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
-        raise WorkerProtocolError("worker must emit exactly one control record")
-    control = WorkerControl.from_json(raw[:-1])
+def _control_present(directory: Path) -> bool:
+    try:
+        (directory / CONTROL_NAME).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise WorkerProtocolError("worker control record could not be inspected") from error
+    return True
+
+
+def _read_control(directory: Path, engine: str, version: str) -> WorkerControl:
+    path = directory / CONTROL_NAME
+    try:
+        status = path.lstat()
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+            raise WorkerProtocolError("worker control record is not an owned regular file")
+        if status.st_size > MAX_CONTROL_BYTES:
+            raise WorkerProtocolError("worker control record exceeds 16 KiB")
+        raw = path.read_bytes()
+        path.unlink()
+    except FileNotFoundError as error:
+        raise WorkerProtocolError("worker control record is missing") from error
+    except WorkerProtocolError:
+        raise
+    except OSError as error:
+        raise WorkerProtocolError("worker control record could not be validated") from error
+    control = WorkerControl.from_json(raw)
     if control.engine != engine or control.engine_version != version:
         raise WorkerProtocolError("worker control identity does not match the request")
     return control
@@ -316,8 +289,7 @@ def _validated_artifact(directory: Path, metadata: ObservationMetadata) -> bytes
         payload = path.read_bytes()
     except OSError as error:
         raise WorkerProtocolError("worker artifact could not be validated") from error
-    digest_mismatch = hashlib.sha256(payload).hexdigest() != metadata.sha256
-    if len(payload) != metadata.byte_count or digest_mismatch:
+    if not digest_matches(payload, metadata.sha256, metadata.byte_count):
         raise WorkerProtocolError("worker artifact digest does not match its control record")
     return payload
 
@@ -333,18 +305,3 @@ def _require_inventory(directory: Path, expected: set[str]) -> None:
 
 def _normalize(payload: bytes, owned_root: Path) -> str:
     return payload.decode("utf-8", errors="replace").replace(str(owned_root), "<PARQUITY_TEMP>")
-
-
-def _control_metadata(data: Mapping[str, object]) -> ObservationMetadata | None:
-    keys = ("artifact_bytes", "artifact_sha256", "row_count", "column_count", "schema_sha256")
-    values = tuple(data[key] for key in keys)
-    if all(value is None for value in values):
-        return None
-    if any(value is None for value in values):
-        raise WorkerProtocolError("worker observation metadata is incomplete")
-    size, digest, rows, columns, schema = values
-    if not isinstance(digest, str) or not isinstance(schema, str):
-        raise WorkerProtocolError("worker observation digests are malformed")
-    byte_count = codec.integer(size, "artifact bytes")
-    counts = (codec.integer(rows, "row count"), codec.integer(columns, "column count"))
-    return ObservationMetadata(byte_count, digest, *counts, schema)

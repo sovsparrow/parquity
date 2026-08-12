@@ -47,7 +47,7 @@ def main() -> int:
 
 def _complete(mode: str, directory: Path) -> int:
     if mode in {"malformed", "extra", "oversized", "noncanonical", "wrong-engine", "incomplete"}:
-        return _control_failure(mode)
+        return _control_failure(mode, directory)
     if mode in {
         "bad-digest",
         "bad-control-digest",
@@ -59,11 +59,15 @@ def _complete(mode: str, directory: Path) -> int:
     if mode == "success":
         artifact = b"controlled artifact"
         (directory / "observation.arrow").write_bytes(artifact)
-        sys.stdout.buffer.write(_control("SUCCESS", artifact) + b"\n")
+        (directory / "control.json").write_bytes(_control("SUCCESS", artifact))
     elif mode == "provider":
-        sys.stdout.buffer.write(_control("PROVIDER_ERROR") + b"\n")
+        (directory / "control.json").write_bytes(_control("PROVIDER_ERROR"))
+    elif mode == "noisy-stdout":
+        sys.stdout.write("x" * (16 * 1024 + 1))
+        sys.stdout.flush()
+        (directory / "control.json").write_bytes(_control("PROVIDER_ERROR"))
     elif mode == "internal":
-        sys.stdout.buffer.write(_control("INTERNAL_ERROR") + b"\n")
+        (directory / "control.json").write_bytes(_control("INTERNAL_ERROR"))
     elif mode == "exit":
         raise SystemExit(7)
     elif mode == "empty":
@@ -84,23 +88,24 @@ def _diagnostic(mode: str, directory: Path) -> int:
         os.abort()
     sys.stderr.write(str(directory) + "x" * (64 * 1024 + 1))
     sys.stderr.flush()
-    sys.stdout.buffer.write(_control("PROVIDER_ERROR") + b"\n")
+    (directory / "control.json").write_bytes(_control("PROVIDER_ERROR"))
     return 0
 
 
-def _control_failure(mode: str) -> int:
+def _control_failure(mode: str, directory: Path) -> int:
     if mode == "malformed":
-        sys.stdout.write("not-json\n")
+        payload = b"not-json"
     elif mode == "extra":
-        sys.stdout.buffer.write(_control("PROVIDER_ERROR") + b"\nextra\n")
+        payload = _control("PROVIDER_ERROR") + b"\nextra"
     elif mode == "oversized":
-        sys.stdout.write("x" * (16 * 1024 + 1))
+        payload = b"x" * (16 * 1024 + 1)
     elif mode == "noncanonical":
-        sys.stdout.write(json.dumps(json.loads(_control("PROVIDER_ERROR")), indent=2) + "\n")
+        payload = json.dumps(json.loads(_control("PROVIDER_ERROR")), indent=2).encode()
     elif mode == "wrong-engine":
-        sys.stdout.buffer.write(_changed_control("PROVIDER_ERROR", engine="other") + b"\n")
+        payload = _changed_control("PROVIDER_ERROR", engine="other")
     else:
-        sys.stdout.buffer.write(_changed_control("PROVIDER_ERROR", artifact_bytes=1) + b"\n")
+        payload = _changed_control("PROVIDER_ERROR", artifact_bytes=1)
+    (directory / "control.json").write_bytes(payload)
     return 0
 
 
@@ -123,7 +128,7 @@ def _artifact_failure(mode: str, directory: Path) -> int:
         target.write_bytes(artifact)
         (directory / "observation.arrow").symlink_to(target)
         control = _control("SUCCESS", artifact)
-    sys.stdout.buffer.write(control + b"\n")
+    (directory / "control.json").write_bytes(control)
     return 0
 
 

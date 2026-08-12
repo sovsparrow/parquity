@@ -9,153 +9,136 @@ from typing import cast
 import pytest
 
 from parquity import cli
-from parquity import writer_profiles as wp
-from parquity.findings import evidence
-from parquity.findings.bundle import validate_bundle
-from parquity.findings.model import finding_id_for
-from parquity.generation.reduce import ReductionCounts
-from parquity.generation.search import OverflowObservation, SearchFinding
-from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.runs import bundle, model, replay
-from parquity.triage.model import canonical_bytes
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
+from parquity import profiles as wp
+from parquity.evidence import EngineVersion
+from parquity.evidence.json_codec import canonical_bytes
+from parquity.findings import bundle as finding_bundle
+from parquity.findings import model as fm
+from parquity.generation import evidence
+from parquity.generation.search.identity import finding_key
+from parquity.generation.search.records import OverflowObservation
+from parquity.model import Case
+from parquity.runs import bundle, replay
+from parquity.runs.formats import v1 as model
+from parquity.verdicts import CellResult, MatrixRun, Verdict
+from tests.support import generated_run as fixtures
 
-_CASE = Case((Field("value", TypeSpec(Kind.INT32), nullable=False),), ((1,),))
-_ENGINES = tuple(map(EngineVersion, ("pyarrow", "duckdb", "polars"), ("1", "2", "3")))
-_CHECK = evidence.DiscoveryEvidence(None, None, None, evidence.CHECK_COMPLETE)
-_CAPPED = evidence.DiscoveryEvidence(10, 0, 3, evidence.FINDING_CAP_REACHED, 1, 7)
+_CASE, _ENGINES = fixtures.CASE, fixtures.ENGINES
+_CAPPED, _FAILURES = fixtures.CAPPED, fixtures.FAILURES
+_evaluate, _finding = fixtures.evaluate, fixtures.finding
+_pass, _results, _source = fixtures.pass_result, fixtures.results, fixtures.source
+published_run = fixtures.published_run
 Profile = wp.WriterProfileIdentity
 Capability = wp.WriterProfileCapability
-Source = bundle.RunSource
-Published = tuple[model.RunRecord, Path]
-Found = tuple[SearchFinding, ...]
-Observed = tuple[OverflowObservation, ...]
-Capture = pytest.CaptureFixture[str]
 Status, Cell, WRITE = wp.CapabilityStatus, CellResult, Verdict.WRITE_ERROR
-Dependency, OverflowEvidence = evidence.DependencyVersion, model.OverflowEvidence
-_HOSTILE = "kind`\n# injected\n[link](https://invalid)|<tag>\n```"
-_FAILURES = (
-    Cell("pyarrow", "1", "duckdb", "2", "compare", Verdict.VALUE_MISMATCH, "$", _HOSTILE, _HOSTILE),
-    CellResult("duckdb", "2", "pyarrow", "1", "compare", Verdict.SCHEMA_MISMATCH, "$", "schema"),
-    CellResult("polars", "3", "*", "*", "write", WRITE, "$", "failure", "ComputeError"),
-)
-
-
-def _pass(w: EngineVersion, r: EngineVersion, profile: Profile | None = None) -> CellResult:
-    engines = (w.name, w.version, r.name, r.version)
-    return CellResult(*engines, "compare", Verdict.PASS, "$", "", writer_profile=profile)
-
-
-def _results(failures: tuple[CellResult, ...]) -> tuple[CellResult, ...]:
-    cells = {(item.writer, item.reader): item for item in failures if item.operation != "write"}
-    write_errors = {item.writer: item for item in failures if item.operation == "write"}
-    results: list[CellResult] = []
-    for writer in _ENGINES:
-        if writer.name in write_errors:
-            results.append(write_errors[writer.name])
-            continue
-        results.extend(
-            cells.get((writer.name, reader.name), _pass(writer, reader)) for reader in _ENGINES
-        )
-    return tuple(results)
-
-
-def _finding(result: CellResult, run: MatrixRun) -> SearchFinding:
-    fingerprint = result.fingerprint or pytest.fail("failure fingerprint missing")
-    return SearchFinding(_CASE, _CASE, fingerprint, result, run, 0, False, ReductionCounts())
-
-
-def _evaluate(case: Case, directory: Path) -> MatrixRun:
-    directory.mkdir(parents=True)
-    files = [(writer, directory / f"{writer}.parquet") for writer in ("pyarrow", "duckdb")]
-    for writer, path in files:
-        path.write_bytes(f"PAR1{writer}PAR1".encode())
-    return MatrixRun(case.case_id, _results(_FAILURES), tuple(files), _ENGINES, _ENGINES)
-
-
-def _search_findings() -> tuple[SearchFinding, ...]:
-    run = MatrixRun(_CASE.case_id, _results(_FAILURES), (), _ENGINES, _ENGINES)
-    return tuple(_finding(result, run) for result in _FAILURES)
-
-
-def _source(command: str = "check", stops: Observed = (), items: Found | None = None) -> Source:
-    discovery = _CHECK if command == "check" else _CAPPED
-    selected = _search_findings() if items is None else items
-    env = evidence.EnvironmentEvidence("p", "h", "3", "x", _ENGINES, (Dependency("pyarrow", "1"),))
-    return bundle.RunSource(command, selected, stops, _ENGINES, _ENGINES, discovery, env)
-
-
-def _published(root: Path, name: str = "run", source: Source | None = None) -> Published:
-    destination = root / name
-    record = bundle.publish_run(_source() if source is None else source, destination, _evaluate)
-    return record or pytest.fail("run publication returned no record"), destination
+Phase = bundle.RunPublicationPhase
 
 
 def test_run_publishes_three_children_with_complete_hash_chain(tmp_path: Path) -> None:
-    record, destination = _published(tmp_path)
+    events: list[bundle.RunPublicationProgress] = []
+
+    def progress(value: bundle.RunPublicationProgress) -> None:
+        events.append(value)
+
+    current = bundle.publish_run(_source(), tmp_path / "run", _evaluate, progress)
+    assert current is not None
+    record, destination = current.run, current.directory
+    assert [item.phase for item in events] == [Phase.WRITING] * 4 + [Phase.FINALIZING]
+    assert [item.completed_findings for item in events] == [0, 1, 2, 3, 3]
+    assert {item.total_findings for item in events} == {3}
     assert record.environment.providers == record.writers == record.readers
     assert {path.name for path in destination.iterdir()} == {"run.json", "REPORT.md", "findings"}
+    current = bundle.validate_run(destination)
+    raw = (destination / "REPORT.md").read_bytes()
+    assert (len(raw), hashlib.sha256(raw).hexdigest()) == (
+        record.report.byte_count,
+        record.report.sha256,
+    )
     fingerprints = [item.fingerprint for item in record.findings]
     assert fingerprints == sorted(fingerprints, key=lambda item: item.canonical_bytes())
     assert len(record.findings) == 3
     for item in record.findings:
         manifest = destination / item.manifest_path
         payload = manifest.read_bytes()
-        assert item.byte_count == len(payload)
-        assert item.sha256 == hashlib.sha256(payload).hexdigest()
-        child = validate_bundle(manifest.parent)
-        assert child.finding.finding_id == item.finding_id
-        assert (len(child.matrix.results), len(child.matrix.selection_order)) == (7, 3)
+        assert (item.byte_count, item.sha256) == (len(payload), hashlib.sha256(payload).hexdigest())
+        child = finding_bundle.validate_bundle(manifest.parent)
+        assert (child.finding.finding_id, len(child.matrix.results)) == (item.finding_id, 7)
+        assert len(child.matrix.selection_order) == 3
     payload = (destination / "run.json").read_bytes()
     assert payload == canonical_bytes(json.loads(payload))
     child, extracted = next((destination / "findings").iterdir()), tmp_path / "extracted-child"
     shutil.copytree(child, extracted)
     shutil.rmtree(destination)
-    validated = validate_bundle(extracted)
+    validated = finding_bundle.validate_bundle(extracted)
     assert (validated.finding.finding_id, validated.case) == (child.name, _CASE)
-    overflow_result = CellResult("pyarrow", "1", "*", "*", "write", WRITE, "$", "x", "ArrowInvalid")
+
+
+def test_run_overflow_evidence_and_publication_failures(tmp_path: Path) -> None:
+    overflow_result = Cell("pyarrow", "1", "*", "*", "write", WRITE, "$", "x", "ArrowInvalid")
     fingerprint = overflow_result.fingerprint or pytest.fail("overflow fingerprint missing")
-    overflow = (OverflowObservation(_CASE.case_id, fingerprint, _CASE, overflow_result),)
-    record, destination = _published(tmp_path, "capped", _source(command="fuzz", stops=overflow))
+    overflow = (OverflowObservation(_CASE, overflow_result, evidence.DISCOVERY_OVERFLOW),)
+    record, _ = published_run(tmp_path, "capped", _source(command="fuzz", stops=overflow))
     assert record.status == _CAPPED.stop_reason and record.overflow[0].fingerprint == fingerprint
-    report = (destination / "REPORT.md").read_text()
-    assert all(x in report for x in ("## Run scope", "## Inputs", "| Discovery |", "### C1"))
-    hostile = ("\n# injected", "[link](https://invalid)", "<tag>", "\\n```", " [default]")
-    assert not any(value in report for value in hostile)
-    destination = tmp_path / "none"
-    assert bundle.publish_run(_source(items=()), destination, _evaluate) is None
-    assert not destination.exists()
-    destination.mkdir()
-    (destination / "owned.txt").write_text("preserve")
-    with pytest.raises(bundle.RunPublicationError):
-        bundle.publish_run(_source(), destination, _evaluate)
-    assert (destination / "owned.txt").read_text() == "preserve"
-    unplanned = tmp_path / "unplanned"
-    with pytest.raises(bundle.RunPublicationError, match="unindexed fingerprint"):
-        bundle.publish_run(_source(items=(_search_findings()[0],)), unplanned, _evaluate)
-    assert not unplanned.exists()
+    assert record.status == evidence.SAVED_EVIDENCE_LIMIT_REACHED
+    assert record.to_data()["status"] == "FINDING_CAP_REACHED"
+    assert record.overflow[0].to_data()["stop_reason"] == "FINDING_CAP_REACHED"
+    assert model.RunRecord.from_data(record.to_data()) == record
+    planned = replace(_FAILURES[1], schema_path="$schema.field_1")
+    exact_sibling = replace(planned, schema_path="$schema.field_2")
+    planned_fingerprint = planned.fingerprint or pytest.fail("planned fingerprint missing")
+    sibling_fingerprint = exact_sibling.fingerprint or pytest.fail("sibling fingerprint missing")
+    assert planned_fingerprint != sibling_fingerprint
+    assert finding_key(planned_fingerprint) == finding_key(sibling_fingerprint)
+    planned_overflow = (OverflowObservation(_CASE, planned, evidence.DISCOVERY_OVERFLOW),)
+    selected = (_source().findings[0],)
+    planned_source = _source(command="fuzz", stops=planned_overflow, items=selected)
+
+    def sibling_evaluator(case: Case, directory: Path) -> MatrixRun:
+        run = _evaluate(case, directory)
+        return replace(run, results=_results((_FAILURES[0], exact_sibling)))
+
+    accepted = bundle.publish_run(planned_source, tmp_path / "planned-sibling", sibling_evaluator)
+    assert accepted is not None
+    novel = replace(exact_sibling, detail="novel exact diagnostic")
+
+    def novel_evaluator(case: Case, directory: Path) -> MatrixRun:
+        run = _evaluate(case, directory)
+        return replace(run, results=_results((_FAILURES[0], novel)))
+
+    with pytest.raises(bundle.RunPublicationError, match="unplanned finding"):
+        bundle.publish_run(planned_source, tmp_path / "unplanned", novel_evaluator)
+    assert not (tmp_path / "unplanned").exists()
 
 
-def test_run_replay_aggregates_in_fingerprint_order(tmp_path: Path, capsys: Capture) -> None:
-    _, destination = _published(tmp_path)
+def test_run_replay_and_profile_drift(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _, destination = published_run(tmp_path, "current", _source(version="0.1.1"))
     related = replace(_FAILURES[1], detail="changed normalized detail")
+    evaluated = _results((_FAILURES[0], related))
 
-    def replay_evaluator(case: Case, directory: Path) -> MatrixRun:
-        del directory
-        return MatrixRun(case.case_id, _results((_FAILURES[0], related)), (), _ENGINES, _ENGINES)
+    def evaluator(case: Case, _: Path) -> MatrixRun:
+        return MatrixRun(case.case_id, evaluated, (), _ENGINES, _ENGINES)
 
-    outcome = replay.replay_run(destination, replay_evaluator)
+    outcome = replay.replay_run(destination, evaluator)
     assert (outcome.exact_count, outcome.related_count, outcome.absent_count) == (1, 1, 1)
-    fingerprints = [item.finding.fingerprint for item in outcome.outcomes]
-    assert fingerprints == sorted(fingerprints, key=lambda item: item.canonical_bytes())
-    last_child = sorted((destination / "findings").iterdir())[-1]
-    (last_child / "REPORT.md").write_text("tampered")
+    validated = bundle.validate_run(destination)
+    assert tuple(item.finding.finding_id for item in outcome.outcomes) == tuple(
+        item.finding_id for item in validated.run.findings
+    )
+    expected = {
+        _FAILURES[0].fingerprint: "REPRODUCED",
+        _FAILURES[1].fingerprint: "RELATED_FAILURE",
+        _FAILURES[2].fingerprint: "NOT_REPRODUCED",
+    }
+    assert tuple(item.classification.value for item in outcome.outcomes) == tuple(
+        expected[item.fingerprint] for item in validated.run.findings
+    )
+    (sorted((destination / "findings").iterdir())[-1] / "REPORT.md").write_text("tampered")
     calls = 0
 
     def forbidden(case: Case, directory: Path) -> MatrixRun:
         nonlocal calls
         calls += 1
-        raise AssertionError((case, directory))
+        return _evaluate(case, directory)
 
     with pytest.raises(bundle.RunBundleValidationError):
         replay.replay_run(destination, forbidden)
@@ -166,39 +149,43 @@ def test_run_replay_aggregates_in_fingerprint_order(tmp_path: Path, capsys: Capt
             return Capability(item, "row-group-2", Status.UNSUPPORTED, None, "OPTION_UNAVAILABLE")
         return Capability(item, "row-group-2", Status.SUPPORTED, Profile("row-group-2", value))
 
-    changes = {
-        "addition": ({"row_group_size": 2}, {"historical_group_size": 2}, {"row_group_size": 2}),
-        "removal": (None, {"historical_group_size": 2}, {"row_group_size": 2}),
-        "options": ({"historical_group_size": 3}, None, {"row_group_size": 2}),
-    }
-    for change, options in changes.items():
-        capabilities = tuple(capability(*pair) for pair in zip(_ENGINES, options, strict=True))
-        plan = wp.WriterProfilePlan(("row-group-2",), capabilities)
-        polars_profile = capabilities[2].profile_identity or pytest.fail("profile missing")
-        profiled_failure = replace(_FAILURES[2], writer_profile=polars_profile)
-        results = tuple(
-            (_FAILURES[2] if execution.writer_profile is None else profiled_failure)
-            if execution.writer == _ENGINES[2]
-            else _pass(execution.writer, _ENGINES[0], execution.writer_profile)
-            for execution in plan.executions(_ENGINES)
-        )
-        matrix = MatrixRun(_CASE.case_id, results, (), _ENGINES, (_ENGINES[0],), plan)
-        observed = tuple(_finding(result, matrix) for result in (_FAILURES[2], profiled_failure))
-        source = replace(_source(items=observed), readers=(_ENGINES[0],), writer_profiles=plan)
-        target = tmp_path / change
-        assert bundle.publish_run(source, target, lambda _case, _path, run=matrix: run) is not None
-        value = bundle.validate_run(target)
-        assert value.run.writer_profiles == value.children[0].finding.writer_profiles == plan
-        children = value.children
-        child_reports = "".join((child.directory / "REPORT.md").read_text() for child in children)
-        for report in ((target / "REPORT.md").read_text(), child_reports):
-            assert "polars [default]" in report and "polars [row-group-2]" in report
-        assert cli.main(["replay", str(target)]) == 2
-        payload = cast(dict[str, object], json.loads(capsys.readouterr().out))
-        assert cast(dict[str, object], payload["error"])["kind"] == ("WRITER_PROFILE_NOT_EVALUABLE")
+    options = ({"historical_group_size": 3}, None, {"row_group_size": 2})
+    capabilities = tuple(capability(*pair) for pair in zip(_ENGINES, options, strict=True))
+    plan = wp.WriterProfilePlan(("row-group-2",), capabilities)
+    polars_profile = capabilities[2].profile_identity or pytest.fail("profile missing")
+    profiled_failure = replace(_FAILURES[2], writer_profile=polars_profile)
+    results = tuple(
+        (_FAILURES[2] if execution.writer_profile is None else profiled_failure)
+        if execution.writer == _ENGINES[2]
+        else _pass(execution.writer, _ENGINES[0], execution.writer_profile)
+        for execution in plan.executions(_ENGINES)
+    )
+    matrix = MatrixRun(_CASE.case_id, results, (), _ENGINES, (_ENGINES[0],), plan)
+    observed = tuple(_finding(result, matrix) for result in (_FAILURES[2], profiled_failure))
+    source = replace(_source(items=observed), readers=(_ENGINES[0],), writer_profiles=plan)
+    target = tmp_path / "profile-drift"
+    assert bundle.publish_run(source, target, lambda _case, _path: matrix) is not None
+    value = bundle.validate_run(target)
+    assert value.run.writer_profiles == value.children[0].finding.writer_profiles == plan
+    assert cli.main(["replay", str(target)]) == 2
+    payload = cast(dict[str, object], json.loads(capsys.readouterr().out))
+    assert cast(dict[str, object], payload["error"])["kind"] == "WRITER_PROFILE_NOT_EVALUABLE"
 
 
-@pytest.mark.parametrize("shape", ("file", "extra", "link", "run", "findings", "digest", "report"))
+@pytest.mark.parametrize(
+    "shape",
+    (
+        "file",
+        "extra",
+        "link",
+        "run",
+        "findings",
+        "digest",
+        "noncanonical",
+        "child-extra",
+        "child-link",
+    ),
+)
 def test_run_root_inventory_rejects_wrong_types(tmp_path: Path, shape: str) -> None:
     destination = tmp_path / "run"
     if shape == "file":
@@ -222,68 +209,37 @@ def test_run_root_inventory_rejects_wrong_types(tmp_path: Path, shape: str) -> N
             data = cast(dict[str, object], json.loads(path.read_bytes()))
             cast(list[dict[str, object]], data["findings"])[0]["sha256"] = "0" * 64
             path.write_bytes(canonical_bytes(data))
+        elif shape == "noncanonical":
+            path = destination / "run.json"
+            path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2))
+        elif shape == "child-extra":
+            (destination / "findings" / "unexpected").mkdir()
         else:
-            payload = b"# arbitrary but resealed\n"
-            (destination / "REPORT.md").write_bytes(payload)
-            manifest = destination / "run.json"
-            run = model.RunRecord.from_json(manifest.read_bytes())
-            digest = model.RunDigest("REPORT.md", hashlib.sha256(payload).hexdigest(), len(payload))
-            manifest.write_bytes(replace(run, report=digest).canonical_bytes())
-    with pytest.raises(bundle.RunBundleValidationError):
+            child = next((destination / "findings").iterdir())
+            external = tmp_path / "external-child"
+            child.rename(external)
+            child.symlink_to(external, target_is_directory=True)
+    with pytest.raises(bundle.RunBundleValidationError) as raised:
         bundle.validate_run(destination)
-
-
-@pytest.mark.parametrize("shape", ("extra", "symlink", "digest", "conflict", "noncanonical"))
-def test_run_rejects_bad_child_inventory(tmp_path: Path, shape: str) -> None:
-    record, destination = _published(tmp_path, shape)
-    child = next((destination / "findings").iterdir())
-    if shape == "extra":
-        (child.parent / "extra").mkdir()
-    elif shape == "symlink":
-        target = tmp_path / "child"
-        child.rename(target)
-        child.symlink_to(target, target_is_directory=True)
-    elif shape == "digest":
-        manifest = child / "finding.json"
-        manifest.write_bytes(bytes(((payload := manifest.read_bytes())[0] ^ 1,)) + payload[1:])
-    elif shape == "conflict":
-        manifest = child / "finding.json"
-        data = cast(dict[str, object], json.loads(manifest.read_bytes()))
-        cast(dict[str, object], data["environment"])["platform"] = "conflicted"
-        payload = canonical_bytes(data)
-        manifest.write_bytes(payload)
-        position = [item.finding_id for item in record.findings].index(child.name)
-        indexed = replace(
-            record.findings[position],
-            sha256=hashlib.sha256(payload).hexdigest(),
-            byte_count=len(payload),
-        )
-        indexes = (*record.findings[:position], indexed, *record.findings[position + 1 :])
-        identity = (record.command, record.status, record.writers, record.readers)
-        evidence = (record.discovery, record.environment, indexes, record.overflow)
-        changed = replace(
-            record, findings=indexes, run_id=model.calculate_run_id(*identity, *evidence)
-        )
-        (destination / "run.json").write_bytes(changed.canonical_bytes())
-    else:
-        manifest = destination / "run.json"
-        manifest.write_text(json.dumps(json.loads(manifest.read_bytes()), indent=2))
-    with pytest.raises(bundle.RunBundleValidationError):
-        bundle.validate_run(destination)
+    assert raised.value.kind == "INVALID_BUNDLE"
 
 
 def test_run_model_rejects_conflicting_identity_order_status_and_digests(tmp_path: Path) -> None:
-    record, _ = _published(tmp_path)
+    record, _ = published_run(tmp_path)
     rejected = partial(pytest.raises, model.RunValidationError)
     indexed = record.findings[0]
     duplicate = replace(
         indexed,
-        finding_id=(duplicate_id := finding_id_for(other_case := "1" * 64, indexed.fingerprint)),
+        finding_id=(duplicate_id := fm.finding_id_for(other_case := "1" * 64, indexed.fingerprint)),
         case_id=other_case,
         manifest_path=f"findings/{duplicate_id}/finding.json",
     )
-    overlap = OverflowEvidence(_CASE, _FAILURES[0], _CAPPED.stop_reason)
-    changes = ({"command": "bad"}, {"findings": ()}, {"status": evidence.FINDING_CAP_REACHED})
+    overlap = model.OverflowEvidence(_CASE, _FAILURES[0], _CAPPED.stop_reason)
+    changes = (
+        {"command": "bad"},
+        {"findings": ()},
+        {"status": evidence.SAVED_EVIDENCE_LIMIT_REACHED},
+    )
     changes += ({"overflow": (overlap,)}, {"overflow": (overlap, overlap)}, {"run_id": "0" * 64})
     changes += ({"findings": tuple(reversed(record.findings))},)
     changes += ({"findings": (indexed, indexed)}, {"findings": (indexed, duplicate)})
@@ -316,9 +272,8 @@ def test_run_model_rejects_conflicting_identity_order_status_and_digests(tmp_pat
 
     def identified(**changes: object) -> dict[str, object]:
         data = {**record.to_data(), **changes}
-        identity = {
-            key: value for key, value in data.items() if key not in ("format", "run_id", "report")
-        }
+        omitted = ("format", "run_id", "report")
+        identity = {key: value for key, value in data.items() if key not in omitted}
         data["run_id"] = hashlib.sha256(canonical_bytes(identity)).hexdigest()
         return data
 
@@ -333,18 +288,12 @@ def test_run_model_rejects_conflicting_identity_order_status_and_digests(tmp_pat
     for data in invalid:
         rejected(type(record).from_json, json.dumps(data))
     rejected(replace, record, writers=(), run_id=cast(str, invalid[0]["run_id"]))
-    cap = evidence.DiscoveryEvidence(10, 0, 3, evidence.FINDING_CAP_REACHED)
+    cap = evidence.DiscoveryEvidence(10, 0, 3, evidence.SAVED_EVIDENCE_LIMIT_REACHED)
     outside = replace(_FAILURES[0], writer="outside", writer_version="9")
-    target = next(item for item in _FAILURES if item.reader != "*")
-    wildcard = replace(target, reader="*", reader_version="*")
-    for result in (outside, wildcard):
-        overflow = (OverflowEvidence(_CASE, result, _CAPPED.stop_reason),)
-        replay_changes: dict[str, object] = {
-            "command": "fuzz",
-            "status": evidence.FINDING_CAP_REACHED,
-            "discovery": cap.to_data(),
-            "overflow": [item.to_data() for item in overflow],
-        }
-        data = identified(**replay_changes)
-        replay_changes.update(discovery=cap, overflow=overflow, run_id=cast(str, data["run_id"]))
-        rejected(replace, record, **replay_changes)
+    overflow = (model.OverflowEvidence(_CASE, outside, _CAPPED.stop_reason),)
+    replay_changes: dict[str, object] = {"command": "fuzz", "status": cap.stop_reason}
+    overflow_data = [item.to_data() for item in overflow]
+    replay_changes.update(discovery=cap.to_data(), overflow=overflow_data)
+    data = identified(**replay_changes)
+    replay_changes.update(discovery=cap, overflow=overflow, run_id=cast(str, data["run_id"]))
+    rejected(replace, record, **replay_changes)

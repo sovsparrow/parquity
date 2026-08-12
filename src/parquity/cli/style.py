@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Protocol
 
 _RESET = "\x1b[0m"
 _BOLD = "\x1b[1m"
@@ -10,8 +11,10 @@ _ACCENT = "\x1b[38;2;220;113;84m"
 _GOOD = "\x1b[32m"
 _WARN = "\x1b[33m"
 _ERROR = "\x1b[31m"
-_OSC_OPEN = "\x1b]8;;"
-_OSC_CLOSE = "\x1b\\"
+
+
+class TerminalStream(Protocol):
+    def isatty(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,14 +42,11 @@ class Style:
     def error(self, value: str) -> str:
         return self._wrap(value, _ERROR)
 
-    def link(self, label: str, uri: str) -> str:
-        if not self.controls:
-            return label
-        return f"{_OSC_OPEN}{uri}{_OSC_CLOSE}{label}{_OSC_OPEN}{_OSC_CLOSE}"
 
-
-def controls_enabled() -> bool:
-    return "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+def controls_enabled(stream: TerminalStream) -> bool:
+    return (
+        "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb" and bool(stream.isatty())
+    )
 
 
 __all__ = ["Style", "controls_enabled"]

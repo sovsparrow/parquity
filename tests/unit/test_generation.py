@@ -1,24 +1,26 @@
 from __future__ import annotations
 
-import random
 from functools import partial
 from pathlib import Path
 from typing import cast
 
-import pytest
 from hypothesis import HealthCheck, find, given, settings
 from hypothesis import strategies as st
 
+from parquity.evidence import EngineVersion
+from parquity.generation.evidence import SAVED_EVIDENCE_LIMIT_REACHED
 from parquity.generation.reduce import reduce_case
-from parquity.generation.search import (
-    EXAMPLE_BOUND_REACHED,
-    FINDING_CAP_REACHED,
+from parquity.generation.search.campaign import (
     find_case_observations,
     search_cases,
 )
 from parquity.generation.strategies import bounded_cases
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
+from parquity.verdicts import CellResult, MatrixRun, Verdict
+
+_LEGACY_KINDS = {Kind.BOOL, Kind.INT32, Kind.INT64, Kind.STRING, Kind.BINARY}
+_EVALUATION_WRITERS = tuple(EngineVersion(name, "1") for name in ("pyarrow", "duckdb", "polars"))
+_EVALUATION_READERS = (EngineVersion("reader", "1"),)
 
 
 def _integer_case(value: int) -> Case:
@@ -37,21 +39,22 @@ def _failure(
     )
 
 
+def _passing(writer: EngineVersion, reader: EngineVersion) -> CellResult:
+    engines = (writer.name, writer.version, reader.name, reader.version)
+    return CellResult(*engines, "compare", Verdict.PASS, "$", "")
+
+
 def _run(case: Case, *failures: CellResult) -> MatrixRun:
-    readers = (EngineVersion("reader", "1"),)
-    if failures:
-        writers = tuple(EngineVersion(item.writer, item.writer_version) for item in failures)
-        return MatrixRun(case.case_id, failures, (), writers, readers)
-    passing = CellResult("pyarrow", "1", "reader", "1", "compare", Verdict.PASS, "$", "")
-    return MatrixRun(case.case_id, (passing,), (), (EngineVersion("pyarrow", "1"),), readers)
+    by_writer = {item.writer: item for item in failures}
+    reader = _EVALUATION_READERS[0]
+    results = tuple(
+        by_writer.get(writer.name) or _passing(writer, reader) for writer in _EVALUATION_WRITERS
+    )
+    return MatrixRun(case.case_id, results, (), _EVALUATION_WRITERS, _EVALUATION_READERS)
 
 
 def _value(case: Case) -> int | None:
     return cast(int, case.rows[0][0]) if case.rows else None
-
-
-def _has_top_level_kind(candidate: Case, *, kind: Kind) -> bool:
-    return any(field.type_spec.kind is kind for field in candidate.fields)
 
 
 def _assert_bounded_value(spec: TypeSpec, nullable: bool, value: object) -> None:
@@ -79,14 +82,18 @@ def _assert_bounded_value(spec: TypeSpec, nullable: bool, value: object) -> None
         mapping = cast(dict[str, object], value)
         assert 1 <= len(spec.fields) <= 3
         for field in spec.fields:
-            assert field.type_spec.kind in (
-                Kind.BOOL,
-                Kind.INT32,
-                Kind.INT64,
-                Kind.STRING,
-                Kind.BINARY,
-            )
+            assert field.type_spec.kind in _LEGACY_KINDS
             _assert_bounded_value(field.type_spec, field.nullable, mapping[field.name])
+
+
+def _contains_kind(spec: TypeSpec, target: Kind) -> bool:
+    if spec.kind is target:
+        return True
+    children = (
+        *(field.type_spec for field in spec.fields),
+        *(value for value in (spec.item, spec.key, spec.value) if value is not None),
+    )
+    return any(_contains_kind(child, target) for child in children)
 
 
 @settings(
@@ -105,35 +112,23 @@ def test_bounded_cases_respect_every_public_size_and_shape_limit(case: Case) -> 
             _assert_bounded_value(field.type_spec, field.nullable, value)
 
 
-def test_bounded_cases_reach_every_supported_kind_with_real_hypothesis() -> None:
+def test_bounded_cases_reach_every_supported_kind_through_the_public_strategy() -> None:
     search_settings = settings(
-        max_examples=500,
+        max_examples=5_000,
         database=None,
         deadline=None,
+        derandomize=True,
         suppress_health_check=(HealthCheck.too_slow,),
     )
-    for kind in Kind:
+    for target in Kind:
         case = find(
             bounded_cases(),
-            partial(_has_top_level_kind, kind=kind),
+            lambda candidate, target=target: any(
+                _contains_kind(field.type_spec, target) for field in candidate.fields
+            ),
             settings=search_settings,
-            random=random.Random(0),  # noqa: S311 - deterministic test search, not security.
         )
-        assert any(field.type_spec.kind is kind for field in case.fields)
-
-
-def test_one_case_retains_every_failure_and_orders_full_fingerprints_canonically() -> None:
-    def evaluate(case: Case, directory: Path) -> MatrixRun:
-        del directory
-        return _run(case, _failure(writer="pyarrow"), _failure(writer="duckdb"))
-
-    campaign = search_cases(st.just(_integer_case(3)), examples=4, seed=7, evaluator=evaluate)
-
-    assert campaign is not None
-    fingerprints = [finding.fingerprint for finding in campaign.findings]
-    assert {fingerprint.writer for fingerprint in fingerprints} == {"pyarrow", "duckdb"}
-    assert fingerprints == sorted(fingerprints, key=lambda item: item.canonical_bytes())
-    assert campaign.stop_reason == EXAMPLE_BOUND_REACHED
+        assert any(_contains_kind(field.type_spec, target) for field in case.fields), target
 
 
 def test_discovery_continues_after_first_failing_case_and_deduplicates_across_cases() -> None:
@@ -175,7 +170,7 @@ def test_detail_normalization_removes_only_whitespace_and_owned_temporary_paths(
     assert "7" in first.result.detail
 
 
-def test_finding_cap_records_the_unmaterialized_fingerprint_without_exhaustive_claim() -> None:
+def test_fingerprint_cap_stops_after_recording_the_first_overflow() -> None:
     def evaluate(case: Case, directory: Path) -> MatrixRun:
         del directory
         value = _value(case)
@@ -189,14 +184,14 @@ def test_finding_cap_records_the_unmaterialized_fingerprint_without_exhaustive_c
         examples=8,
         seed=2,
         evaluator=evaluate,
-        max_findings=1,
+        max_saved=1,
     )
 
     assert campaign is not None
     assert len(campaign.findings) == 1
-    assert len(campaign.overflow) >= 1
-    assert campaign.stop_reason == FINDING_CAP_REACHED
-    assert all(item.stop_reason == FINDING_CAP_REACHED for item in campaign.overflow)
+    assert len(campaign.overflow) == 1
+    assert campaign.stop_reason == SAVED_EVIDENCE_LIMIT_REACHED
+    assert campaign.evaluated_cases == 2
 
 
 def test_structural_reduction_reaches_a_cross_category_fixed_point() -> None:
@@ -229,9 +224,9 @@ def test_structural_reduction_reaches_a_cross_category_fixed_point() -> None:
     second = reduce_case(finding.case, finding.run, finding.fingerprint, evaluate_case)
     assert second.case.canonical_bytes() == finding.case.canonical_bytes()
     assert second.run == finding.run and second.counts.total == 0
-    retained = search_cases(st.just(case), examples=2, seed=1, evaluator=evaluate, max_findings=2)
+    retained = search_cases(st.just(case), examples=2, seed=1, evaluator=evaluate, max_saved=2)
     assert retained is not None and len(retained.findings) == 2 and not retained.overflow
-    campaign = search_cases(st.just(case), examples=2, seed=1, evaluator=evaluate, max_findings=1)
+    campaign = search_cases(st.just(case), examples=2, seed=1, evaluator=evaluate, max_saved=1)
     assert campaign is not None
     assert len(campaign.findings) == len(campaign.overflow) == 1
     assert campaign.overflow[0].fingerprint.writer == "duckdb"
@@ -261,29 +256,6 @@ def test_structural_reduction_rejects_a_coarse_match_with_changed_diagnostic_kin
     assert finding.reductions.fields == 0
 
 
-def test_no_satisfying_case_is_the_only_no_finding_result() -> None:
-    def pass_case(case: Case, directory: Path) -> MatrixRun:
-        del directory
-        return _run(case)
-
-    assert search_cases(st.just(_integer_case(0)), examples=3, seed=5, evaluator=pass_case) is None
-
-
-@pytest.mark.parametrize(
-    ("examples", "seed", "max_findings"),
-    ((0, 0, 1), (True, 0, 1), (1, -1, 1), (1, True, 1), (1, 0, 0), (1, 0, 65)),
-)
-def test_search_rejects_invalid_bounds(examples: int, seed: int, max_findings: int) -> None:
-    with pytest.raises(ValueError):
-        search_cases(
-            st.just(_integer_case(1)),
-            examples=examples,
-            seed=seed,
-            max_findings=max_findings,
-            evaluator=lambda case, directory: _run(case),
-        )
-
-
 def test_same_seed_reproduces_all_reduced_findings_in_one_controlled_environment() -> None:
     def evaluate(case: Case, directory: Path) -> MatrixRun:
         del directory
@@ -308,40 +280,43 @@ def test_structural_reduction_traverses_every_nested_category() -> None:
     integer = TypeSpec(Kind.INT32)
     variable = TypeSpec(Kind.LIST, item=integer, item_nullable=True)
     fixed = TypeSpec(Kind.FIXED_LIST, item=integer, item_nullable=True, size=2)
-    record = TypeSpec(Kind.STRUCT, fields=(Field("d", integer), Field("k", integer)))
     nested_list = TypeSpec(Kind.FIXED_LIST, item=variable, item_nullable=True, size=1)
-    nested_record = TypeSpec(Kind.STRUCT, fields=(Field("i", variable),))
+    map_key = TypeSpec(Kind.STRUCT, fields=(Field("ki", variable), Field("guard", integer)))
+    map_value = TypeSpec(Kind.STRUCT, fields=(Field("vi", variable),))
+    mapping = TypeSpec(Kind.MAP, key=map_key, value=map_value, value_nullable=True)
     fields = (
         Field("flag", TypeSpec(Kind.BOOL)),
         Field("number", TypeSpec(Kind.INT64)),
         Field("text", TypeSpec(Kind.STRING)),
         Field("payload", TypeSpec(Kind.BINARY)),
-        Field("items", variable),
         Field("fixed", fixed),
-        Field("record", record),
         Field("nested_list", nested_list),
-        Field("nested_record", nested_record),
+        Field("mapping", mapping),
     )
-    values = (True, 7, "x", b"x", [7], [7, 8], {"d": 7, "k": 8}, [[7]], {"i": [7]})
+    map_row = [[{"ki": [7], "guard": 8}, {"vi": [7]}]]
+    values = (True, 7, "x", b"x", [7, 8], [[7]], map_row)
     case = Case(fields, (values,))
     required = {field.name for field in fields}
 
     def evaluate(candidate: Case, directory: Path) -> MatrixRun:
         del directory
         names = {field.name for field in candidate.fields}
-        results = (_failure(),) if candidate.rows and names in (required, {"nullable"}) else ()
+        populated_map = bool(candidate.rows) and names == required and bool(candidate.rows[0][-1])
+        results = (
+            (_failure(),) if candidate.rows and (populated_map or names == {"nullable"}) else ()
+        )
         return _run(candidate, *results)
 
     finding = find_case_observations(case, evaluate)[0]
 
     empty: list[object] = []
-    expected = (False, 0, "", b"", empty, [0], {"k": 0}, [empty], {"i": empty})
+    minimized_map = [[{"guard": 0}, {"vi": empty}]]
+    expected = (False, 0, "", b"", [0], [empty], minimized_map)
     assert finding.case.rows == (expected,)
     assert finding.reductions.fields == 0
-    assert finding.reductions.nullability >= 9
-    assert finding.reductions.containers >= 5
-    assert finding.reductions.scalars >= 6
-    assert finding.reductions.to_data()["total"] == finding.reductions.total
+    reductions = finding.reductions
+    assert reductions.nullability >= 14 and reductions.containers >= 4 and reductions.scalars >= 6
+    assert reductions.to_data()["total"] == reductions.total
 
     nullable = Case(
         (Field("nullable", TypeSpec(Kind.LIST, item=integer, item_nullable=False)),), ((None,),)

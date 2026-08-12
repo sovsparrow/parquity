@@ -1,27 +1,100 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
 
-from ..findings import json_codec as codec
-from ..findings.evidence import (
-    CHECK_COMPLETE,
-    FINDING_CAP_REACHED,
-    DiscoveryEvidence,
+from ...evidence import (
+    EngineVersion,
     EnvironmentEvidence,
-    engine_version_from_data,
+    engine_versions_from_data,
+    fingerprint_selection_issue,
     provider_inventory_matches,
+    sha256_hex,
 )
-from ..findings.observation import fingerprint_shape_is_valid
-from ..verdicts import EngineVersion, FailureFingerprint, Verdict
-from ..writer_profiles import WriterProfilePlan
-from . import RUN_FORMAT, RUN_STATUS_CAP, RUN_STATUS_FINDINGS
-from .entries import OverflowEvidence, RunDigest, RunEntryError, RunFindingIndex
+from ...evidence import json_codec as codec
+from ...generation.evidence import (
+    CHECK_COMPLETE,
+    DISCOVERY_OVERFLOW,
+    MINIMIZATION_OVERFLOW,
+    SAVED_EVIDENCE_LIMIT_REACHED,
+    DiscoveryEvidence,
+    stop_reason_from_v1,
+    stop_reason_to_v1,
+)
+from ...model import Case
+from ...profiles import WriterProfilePlan, optional_writer_profile_plan_from_data
+from ...verdicts import CellResult, FailureFingerprint
+from ..source import RunSource
+from . import RunDigest, RunFindingIndex, RunValidationError
 
-RunValidationError = RunEntryError
+FORMAT_NAME = "parquity.run.v1"
+RUN_STATUS_FINDINGS = "FINDINGS_FOUND"
+RUN_STATUS_SAVED_LIMIT = SAVED_EVIDENCE_LIMIT_REACHED
+
+
+@dataclass(frozen=True, slots=True)
+class OverflowEvidence:
+    case: Case
+    result: CellResult
+    stop_reason: str
+    origin: str = DISCOVERY_OVERFLOW
+
+    def __post_init__(self) -> None:
+        if self.stop_reason != SAVED_EVIDENCE_LIMIT_REACHED:
+            raise RunValidationError("overflow stop reason must be SAVED_EVIDENCE_LIMIT_REACHED")
+        _validate_exact_evidence(self.result, self.origin, "overflow")
+
+    @property
+    def case_id(self) -> str:
+        return self.case.case_id
+
+    @property
+    def fingerprint(self) -> FailureFingerprint:
+        return _result_fingerprint(self.result, "overflow")
+
+    @classmethod
+    def from_parts(
+        cls,
+        case_id: str,
+        fingerprint: FailureFingerprint,
+        case: Case,
+        result: CellResult,
+        stop_reason: str,
+        origin: str = DISCOVERY_OVERFLOW,
+    ) -> OverflowEvidence:
+        value = cls(case, result, stop_reason, origin)
+        _validate_exact_summary(value.case_id, value.fingerprint, case_id, fingerprint, "overflow")
+        return value
+
+    def to_data(self) -> dict[str, object]:
+        data = _exact_evidence_data(self.case, self.result, "overflow")
+        data["stop_reason"] = stop_reason_to_v1(self.stop_reason)
+        data["origin"] = self.origin
+        return data
+
+    @classmethod
+    def from_data(
+        cls, data: Mapping[str, object], *, allow_profile: bool = False
+    ) -> OverflowEvidence:
+        codec.require_exact_keys(
+            data,
+            {"case_id", "fingerprint", "case", "result", "stop_reason", "origin"},
+            "overflow evidence",
+        )
+        case_id, fingerprint, case, result = _exact_evidence_from_data(
+            data,
+            case_label="overflow Case",
+            result_label="overflow result",
+            allow_profile=allow_profile,
+        )
+        return cls.from_parts(
+            case_id,
+            fingerprint,
+            case,
+            result,
+            stop_reason_from_v1(codec.string(codec.required(data, "stop_reason"), "stop_reason")),
+            codec.string(codec.required(data, "origin"), "overflow origin"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,15 +142,14 @@ class RunRecord:
             raise RunValidationError("run findings and overflow must be disjoint")
         fingerprints = (*finding_fingerprints, *overflow_fingerprints)
         if any(
-            not _fingerprint_matches_selection(
-                item, self.writers, self.readers, self.writer_profiles
-            )
+            fingerprint_selection_issue(item, self.writers, self.readers, self.writer_profiles)
+            is not None
             for item in fingerprints
         ):
             raise RunValidationError("run fingerprint conflicts with engine selections")
-        expected_status = RUN_STATUS_CAP if self.overflow else RUN_STATUS_FINDINGS
+        expected_status = status_for_overflow(self.overflow)
         if self.status != expected_status or (
-            bool(self.overflow) != (self.discovery.stop_reason == FINDING_CAP_REACHED)
+            bool(self.overflow) != (self.discovery.stop_reason == SAVED_EVIDENCE_LIMIT_REACHED)
         ):
             raise RunValidationError("run status conflicts with discovery evidence")
         if self.run_id != calculate_run_id(
@@ -95,10 +167,10 @@ class RunRecord:
 
     def to_data(self) -> dict[str, object]:
         data: dict[str, object] = {
-            "format": RUN_FORMAT,
+            "format": FORMAT_NAME,
             "run_id": self.run_id,
             "command": self.command,
-            "status": self.status,
+            "status": stop_reason_to_v1(self.status),
             "writers": [engine.to_data() for engine in self.writers],
             "readers": [engine.to_data() for engine in self.readers],
             "discovery": self.discovery.to_data(),
@@ -112,11 +184,11 @@ class RunRecord:
         return data
 
     def canonical_bytes(self) -> bytes:
-        return _canonical_bytes(self.to_data())
+        return codec.canonical_bytes(self.to_data())
 
     @classmethod
     def from_data(cls, data: Mapping[str, object]) -> RunRecord:
-        plan = _profile_plan(data)
+        plan = optional_writer_profile_plan_from_data(data)
         keys = {
             "format",
             "run_id",
@@ -137,14 +209,14 @@ class RunRecord:
             keys,
             "run manifest",
         )
-        if codec.required(data, "format") != RUN_FORMAT:
-            raise RunValidationError(f"run format must be {RUN_FORMAT!r}")
+        if codec.required(data, "format") != FORMAT_NAME:
+            raise RunValidationError(f"run format must be {FORMAT_NAME!r}")
         return cls(
             run_id=codec.string(codec.required(data, "run_id"), "run_id"),
             command=codec.string(codec.required(data, "command"), "command"),
-            status=codec.string(codec.required(data, "status"), "status"),
-            writers=_engines(data, "writers"),
-            readers=_engines(data, "readers"),
+            status=stop_reason_from_v1(codec.string(codec.required(data, "status"), "status")),
+            writers=engine_versions_from_data(codec.required(data, "writers"), "writers"),
+            readers=engine_versions_from_data(codec.required(data, "readers"), "readers"),
             discovery=DiscoveryEvidence.from_data(
                 codec.mapping(codec.required(data, "discovery"), "discovery")
             ),
@@ -170,8 +242,7 @@ class RunRecord:
     @classmethod
     def from_json(cls, payload: str | bytes) -> RunRecord:
         try:
-            decoded = cast(object, json.loads(payload, object_pairs_hook=codec.unique_object))
-            return cls.from_data(codec.mapping(decoded, "run"))
+            return cls.from_data(codec.mapping(codec.decode(payload), "run"))
         except (codec.FindingValidationError, RunValidationError):
             raise
         except (TypeError, ValueError) as error:
@@ -191,7 +262,7 @@ def calculate_run_id(
 ) -> str:
     identity = {
         "command": command,
-        "status": status,
+        "status": stop_reason_to_v1(status),
         "writers": [engine.to_data() for engine in writers],
         "readers": [engine.to_data() for engine in readers],
         "discovery": discovery.to_data(),
@@ -201,14 +272,47 @@ def calculate_run_id(
     }
     if writer_profiles is not None:
         identity["writer_profiles"] = writer_profiles.to_data()
-    return hashlib.sha256(_canonical_bytes(identity)).hexdigest()
+    return sha256_hex(codec.canonical_bytes(identity))
 
 
-def _engines(data: Mapping[str, object], key: str) -> tuple[EngineVersion, ...]:
-    return tuple(
-        engine_version_from_data(codec.mapping(value, key))
-        for value in codec.sequence(codec.required(data, key), key)
+def build_run_record(
+    source: RunSource,
+    findings: tuple[RunFindingIndex, ...],
+    report: RunDigest,
+) -> RunRecord:
+    overflow = tuple(
+        OverflowEvidence(item.case, item.result, SAVED_EVIDENCE_LIMIT_REACHED, item.origin)
+        for item in sorted(source.overflow, key=lambda item: item.fingerprint.canonical_bytes())
     )
+    status = status_for_overflow(overflow)
+    run_id = calculate_run_id(
+        source.command,
+        status,
+        source.writers,
+        source.readers,
+        source.discovery,
+        source.environment,
+        findings,
+        overflow,
+        source.writer_profiles,
+    )
+    return RunRecord(
+        run_id,
+        source.command,
+        status,
+        source.writers,
+        source.readers,
+        source.discovery,
+        source.environment,
+        findings,
+        overflow,
+        report,
+        source.writer_profiles,
+    )
+
+
+def status_for_overflow(overflow: tuple[OverflowEvidence, ...]) -> str:
+    return RUN_STATUS_SAVED_LIMIT if overflow else RUN_STATUS_FINDINGS
 
 
 def _validate_command(command: str, discovery: DiscoveryEvidence) -> None:
@@ -218,52 +322,68 @@ def _validate_command(command: str, discovery: DiscoveryEvidence) -> None:
         raise RunValidationError("run command conflicts with discovery evidence")
 
 
-def _fingerprint_matches_selection(
+def _validate_exact_evidence(result: CellResult, origin: str, label: str) -> None:
+    if origin not in (DISCOVERY_OVERFLOW, MINIMIZATION_OVERFLOW):
+        raise RunValidationError(f"{label} origin is not recognized")
+    _result_fingerprint(result, label)
+
+
+def _result_fingerprint(result: CellResult, label: str) -> FailureFingerprint:
+    fingerprint = result.fingerprint
+    if fingerprint is None:
+        raise RunValidationError(f"{label} result must be non-passing")
+    return fingerprint
+
+
+def _validate_exact_summary(
+    actual_case_id: str,
+    actual_fingerprint: FailureFingerprint,
+    case_id: str,
     fingerprint: FailureFingerprint,
-    writers: tuple[EngineVersion, ...],
-    readers: tuple[EngineVersion, ...],
-    writer_profiles: WriterProfilePlan | None,
-) -> bool:
-    if not fingerprint_shape_is_valid(fingerprint):
-        return False
-    writer_versions = {engine.name: engine.version for engine in writers}
-    if writer_versions.get(fingerprint.writer) != fingerprint.writer_version:
-        return False
-    if writer_profiles is None:
-        if fingerprint.writer_profile is not None:
-            return False
-    elif not any(
-        item.writer.name == fingerprint.writer and item.writer_profile == fingerprint.writer_profile
-        for item in writer_profiles.executions(writers)
-    ):
-        return False
-    if fingerprint.reader == "*":
-        return (
-            fingerprint.reader_version == "*"
-            and fingerprint.operation == "write"
-            and fingerprint.verdict is Verdict.WRITE_ERROR
-        )
-    reader_versions = {engine.name: engine.version for engine in readers}
-    return reader_versions.get(fingerprint.reader) == fingerprint.reader_version
+    label: str,
+) -> None:
+    if actual_case_id != case_id or actual_fingerprint != fingerprint:
+        raise RunValidationError(f"{label} summary conflicts with its typed evidence")
 
 
-def _profile_plan(data: Mapping[str, object]) -> WriterProfilePlan | None:
-    if "writer_profiles" not in data:
-        return None
-    return WriterProfilePlan.from_data(
-        codec.mapping(codec.required(data, "writer_profiles"), "writer_profiles")
+def _exact_evidence_data(case: Case, result: CellResult, label: str) -> dict[str, object]:
+    return {
+        "case_id": case.case_id,
+        "fingerprint": _result_fingerprint(result, label).to_data(),
+        "case": case.to_data(),
+        "result": result.to_data(),
+    }
+
+
+def _exact_evidence_from_data(
+    data: Mapping[str, object],
+    *,
+    case_label: str,
+    result_label: str,
+    allow_profile: bool,
+) -> tuple[str, FailureFingerprint, Case, CellResult]:
+    return (
+        codec.string(codec.required(data, "case_id"), "case_id"),
+        FailureFingerprint.from_data(
+            codec.mapping(codec.required(data, "fingerprint"), "fingerprint"),
+            allow_profile=allow_profile,
+        ),
+        Case.from_data(codec.mapping(codec.required(data, "case"), case_label)),
+        CellResult.from_data(
+            codec.mapping(codec.required(data, "result"), result_label),
+            allow_profile=allow_profile,
+        ),
     )
 
 
-def _canonical_bytes(data: Mapping[str, object]) -> bytes:
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-
-
 __all__ = [
+    "FORMAT_NAME",
     "OverflowEvidence",
     "RunDigest",
     "RunFindingIndex",
     "RunRecord",
     "RunValidationError",
+    "build_run_record",
     "calculate_run_id",
+    "status_for_overflow",
 ]

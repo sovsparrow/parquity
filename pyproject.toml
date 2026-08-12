@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "parquity"
-version = "0.1.0"
-description = "Find and reproduce semantic disagreements between Parquet engines."
+version = "0.2.0"
+description = "Find and reproduce Parquet interoperability failures."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -40,10 +40,10 @@ parquity = "parquity.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sovsparrow/parquity"
-Documentation = "https://github.com/sovsparrow/parquity/tree/v0.1.0/docs"
+Documentation = "https://github.com/sovsparrow/parquity/tree/v0.2.0/docs"
 Source = "https://github.com/sovsparrow/parquity"
 Issues = "https://github.com/sovsparrow/parquity/issues"
-Changelog = "https://github.com/sovsparrow/parquity/blob/v0.1.0/CHANGELOG.md"
+Changelog = "https://github.com/sovsparrow/parquity/blob/v0.2.0/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

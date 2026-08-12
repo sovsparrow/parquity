@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sovsparrow/parquity/main/assets/parquity-wordmark-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/sovsparrow/parquity/main/assets/parquity-wordmark-light.svg">
-    <img alt="Parquity" src="https://raw.githubusercontent.com/sovsparrow/parquity/main/assets/parquity-wordmark-light.svg" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sovsparrow/parquity/v0.2.0/assets/parquity-wordmark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/sovsparrow/parquity/v0.2.0/assets/parquity-wordmark-light.svg">
+    <img alt="Parquity" src="https://raw.githubusercontent.com/sovsparrow/parquity/v0.2.0/assets/parquity-wordmark-light.svg" width="420">
   </picture>
 </p>
 
@@ -14,7 +14,7 @@
   <a href="https://github.com/sovsparrow/parquity/actions/workflows/ci.yml"><img alt="Continuous integration" src="https://github.com/sovsparrow/parquity/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://pypi.org/project/parquity/"><img alt="PyPI" src="https://img.shields.io/pypi/v/parquity.svg"></a>
   <a href="https://pypi.org/project/parquity/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/parquity.svg"></a>
-  <a href="https://github.com/sovsparrow/parquity/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-282320.svg"></a>
+  <a href="https://github.com/sovsparrow/parquity/blob/v0.2.0/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-282320.svg"></a>
 </p>
 
 Parquity checks whether a logical table survives a Parquet round trip and
@@ -70,7 +70,7 @@ python -m pip install parquity
 
 The base installation includes PyArrow, DuckDB, and Polars. DataFusion and
 fastparquet are optional; see
-[Providers](https://github.com/sovsparrow/parquity/blob/main/docs/providers.md).
+[Providers](https://github.com/sovsparrow/parquity/blob/v0.2.0/docs/providers.md).
 
 Check the installed core matrix:
 
@@ -151,19 +151,19 @@ failure; when it changes the input, the reproducer keeps the supplied Case as
 
 ## Documentation
 
-- [Using Parquity](https://github.com/sovsparrow/parquity/blob/main/docs/usage.md):
+- [Using Parquity](https://github.com/sovsparrow/parquity/blob/v0.2.0/docs/usage.md):
   commands, outputs, limits, exits, and operational warnings.
-- [Writing Cases](https://github.com/sovsparrow/parquity/blob/main/docs/cases.md):
+- [Writing Cases](https://github.com/sovsparrow/parquity/blob/v0.2.0/docs/cases.md):
   the `case.json` grammar, supported types, and values.
-- [Evidence and replay](https://github.com/sovsparrow/parquity/blob/main/docs/evidence.md):
+- [Evidence and replay](https://github.com/sovsparrow/parquity/blob/v0.2.0/docs/evidence.md):
   reports, reproducers, replay states, and safe sharing.
-- [Machine format overview](https://github.com/sovsparrow/parquity/blob/main/docs/machine-formats.md):
+- [Machine format overview](https://github.com/sovsparrow/parquity/blob/v0.2.0/docs/machine-formats.md):
   manifests, identities, canonicalization, and compatibility fields.
-- [Providers](https://github.com/sovsparrow/parquity/blob/main/docs/providers.md):
+- [Providers](https://github.com/sovsparrow/parquity/blob/v0.2.0/docs/providers.md):
   install and select engines and directions.
-- [Writer profiles](https://github.com/sovsparrow/parquity/blob/main/docs/writer-profiles.md):
+- [Writer profiles](https://github.com/sovsparrow/parquity/blob/v0.2.0/docs/writer-profiles.md):
   add compression, row-group, and statistics variants.
-- [Versioning](https://github.com/sovsparrow/parquity/blob/main/VERSIONING.md):
+- [Versioning](https://github.com/sovsparrow/parquity/blob/v0.2.0/VERSIONING.md):
   package releases and public compatibility.
 
 ## Reading a result
@@ -186,10 +186,10 @@ Parquity does not claim to originate cross-engine Parquet testing.
 ## Project
 
 See
-[CONTRIBUTING.md](https://github.com/sovsparrow/parquity/blob/main/CONTRIBUTING.md)
+[CONTRIBUTING.md](https://github.com/sovsparrow/parquity/blob/v0.2.0/CONTRIBUTING.md)
 to work on Parquity. Report suspected vulnerabilities through
-[SECURITY.md](https://github.com/sovsparrow/parquity/blob/main/SECURITY.md),
+[SECURITY.md](https://github.com/sovsparrow/parquity/blob/v0.2.0/SECURITY.md),
 not a public issue.
 
 Parquity is available under the
-[MIT License](https://github.com/sovsparrow/parquity/blob/main/LICENSE).
+[MIT License](https://github.com/sovsparrow/parquity/blob/v0.2.0/LICENSE).

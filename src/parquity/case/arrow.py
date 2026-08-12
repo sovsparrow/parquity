@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import pyarrow as pa
 
-from .model import Case, Field, Kind, TypeSpec
+from .types import Field, Kind, TypeSpec
+
+if TYPE_CHECKING:
+    from ..model import Case
 
 
 class _ArrayFactory(Protocol):

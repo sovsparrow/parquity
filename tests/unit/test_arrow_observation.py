@@ -4,8 +4,8 @@ from typing import Protocol, cast
 
 import pyarrow as pa
 
-from parquity.arrow_bridge import arrow_to_rows
-from parquity.compare import compare_case
+from parquity.case.arrow import arrow_to_rows
+from parquity.comparison.table import compare_case
 from parquity.model import Case, Field, Kind, TypeSpec
 
 

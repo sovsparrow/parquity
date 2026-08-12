@@ -169,7 +169,7 @@ jobs:
           set -euo pipefail
           cd "$ACCEPTANCE_DIR/work"
           set +e
-          "$PACKAGE_ENV/bin/parquity" fuzz --examples 500 --seed 0 --max-findings 8 --out "$ACCEPTANCE_DIR/generic-run" > "$ACCEPTANCE_DIR/generic-fuzz.json" 2> "$ACCEPTANCE_DIR/generic-fuzz.stderr"
+          "$PACKAGE_ENV/bin/parquity" fuzz --examples 500 --seed 0 --max-saved 8 --out "$ACCEPTANCE_DIR/generic-run" > "$ACCEPTANCE_DIR/generic-fuzz.json" 2> "$ACCEPTANCE_DIR/generic-fuzz.stderr"
           generic_code=$?
           set -e
           printf '%s\n' "$generic_code" > "$ACCEPTANCE_DIR/generic-fuzz.exit"
@@ -179,7 +179,7 @@ jobs:
           fi
 
           set +e
-          "$PACKAGE_ENV/bin/parquity" fuzz --schema "$ACCEPTANCE_DIR/schema.json" --examples 100 --seed 42 --max-findings 8 --out "$ACCEPTANCE_DIR/schema-run" > "$ACCEPTANCE_DIR/schema-fuzz.json" 2> "$ACCEPTANCE_DIR/schema-fuzz.stderr"
+          "$PACKAGE_ENV/bin/parquity" fuzz --schema "$ACCEPTANCE_DIR/schema.json" --examples 100 --seed 42 --max-saved 8 --out "$ACCEPTANCE_DIR/schema-run" > "$ACCEPTANCE_DIR/schema-fuzz.json" 2> "$ACCEPTANCE_DIR/schema-fuzz.stderr"
           schema_code=$?
           set -e
           printf '%s\n' "$schema_code" > "$ACCEPTANCE_DIR/schema-fuzz.exit"
@@ -227,7 +227,7 @@ jobs:
           set -euo pipefail
           cd "$ACCEPTANCE_DIR/work"
           set +e
-          "$PACKAGE_ENV/bin/parquity" scan "$ACCEPTANCE_DIR/input.parquet" --out "$ACCEPTANCE_DIR/scan-run" --engines pyarrow,duckdb,polars,datafusion,fastparquet --timeout 30 --max-findings 8 > "$ACCEPTANCE_DIR/scan.json" 2> "$ACCEPTANCE_DIR/scan.stderr"
+          "$PACKAGE_ENV/bin/parquity" scan "$ACCEPTANCE_DIR/input.parquet" --out "$ACCEPTANCE_DIR/scan-run" --engines pyarrow,duckdb,polars,datafusion,fastparquet --timeout 30 --max-saved 8 > "$ACCEPTANCE_DIR/scan.json" 2> "$ACCEPTANCE_DIR/scan.stderr"
           scan_code=$?
           set -e
           printf '%s\n' "$scan_code" > "$ACCEPTANCE_DIR/scan.exit"
@@ -256,7 +256,7 @@ jobs:
           if payload.get("readers") != expected or "output" in payload:
               raise SystemExit("Synthetic scan did not exercise the complete reader set")
           PY
-      - name: Replay and triage published runs
+      - name: Replay published runs
         shell: bash
         run: |
           set -euo pipefail
@@ -268,7 +268,6 @@ jobs:
           for run in "${runs[@]}"; do
             run_name=$(basename "$run")
             replay_path="$ACCEPTANCE_DIR/$run_name-replay.json"
-            triage_path="$ACCEPTANCE_DIR/$run_name-triage.json"
             set +e
             "$PACKAGE_ENV/bin/parquity" replay "$run" > "$replay_path" 2> "$ACCEPTANCE_DIR/$run_name-replay.stderr"
             replay_code=$?
@@ -278,35 +277,23 @@ jobs:
               echo "Replay did not reproduce $run_name" >&2
               exit 1
             fi
-            set +e
-            "$PACKAGE_ENV/bin/parquity" triage "$run" --replay-evidence "$replay_path" > "$triage_path" 2> "$ACCEPTANCE_DIR/$run_name-triage.stderr"
-            triage_code=$?
-            set -e
-            printf '%s\n' "$triage_code" > "$ACCEPTANCE_DIR/$run_name-triage.exit"
-            if [[ "$triage_code" -ne 0 ]]; then
-              echo "Triage did not complete for $run_name" >&2
-              exit 1
-            fi
-            "$PACKAGE_ENV/bin/python" - "$replay_path" "$triage_path" <<'PY'
+            "$PACKAGE_ENV/bin/python" - "$replay_path" <<'PY'
           import json
           import sys
           from pathlib import Path
 
-          for path, command, status in (
-              (Path(sys.argv[1]), "replay", "REPRODUCED"),
-              (Path(sys.argv[2]), "triage", "TRIAGED"),
-          ):
-              raw = path.read_bytes()
-              payload = json.loads(raw)
-              canonical = json.dumps(
-                  payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-              ).encode("utf-8") + b"\n"
-              if raw != canonical:
-                  raise SystemExit(f"{path.name} is not canonical JSON")
-              if payload.get("format") != "parquity.cli.v1":
-                  raise SystemExit(f"{path.name} has an unexpected format")
-              if payload.get("command") != command or payload.get("status") != status:
-                  raise SystemExit(f"{path.name} has an unexpected result")
+          path = Path(sys.argv[1])
+          raw = path.read_bytes()
+          payload = json.loads(raw)
+          canonical = json.dumps(
+              payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+          ).encode("utf-8") + b"\n"
+          if raw != canonical:
+              raise SystemExit(f"{path.name} is not canonical JSON")
+          if payload.get("format") != "parquity.cli.v1":
+              raise SystemExit(f"{path.name} has an unexpected format")
+          if payload.get("command") != "replay" or payload.get("status") != "REPRODUCED":
+              raise SystemExit(f"{path.name} has an unexpected result")
           PY
           done
       - name: Upload product evidence

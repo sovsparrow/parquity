@@ -6,7 +6,7 @@ from decimal import Decimal
 import pyarrow as pa
 import pytest
 
-from parquity.arrow_bridge import case_to_arrow
+from parquity.case.arrow import case_to_arrow
 from parquity.model import Case, Field, Kind, TypeSpec
 
 _LEGACY = (

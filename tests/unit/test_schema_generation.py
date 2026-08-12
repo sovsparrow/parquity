@@ -8,11 +8,12 @@ from typing import cast
 import pytest
 from hypothesis import HealthCheck, find, settings
 
-from parquity.findings.evidence import DISCOVERY_OVERFLOW
+from parquity.evidence import EngineVersion
+from parquity.generation.evidence import DISCOVERY_OVERFLOW
 from parquity.generation.schema import SchemaPlan, SchemaProfileError, load_schema
-from parquity.generation.search import find_case_observations, search_cases
+from parquity.generation.search.campaign import find_case_observations, search_cases
 from parquity.model import Case, Field, Kind, TypeSpec
-from parquity.verdicts import CellResult, EngineVersion, MatrixRun, Verdict
+from parquity.verdicts import CellResult, MatrixRun, Verdict
 
 
 def _field(name: str, spec: TypeSpec | None = None, *, nullable: bool = False) -> Field:
@@ -290,7 +291,7 @@ def test_schema_guard_precedes_evaluation_and_reduction_changes_only_rows_and_va
         guarded(foreign, tmp_path)
 
 
-def test_schema_search_retains_multiple_fingerprints_reports_overflow_and_is_seeded() -> None:
+def test_schema_search_retains_fingerprints_records_overflow_and_is_seeded() -> None:
     fields = (_field("value"),)
     plan = SchemaPlan.from_case(Case(fields, ()))
 
@@ -317,7 +318,7 @@ def test_schema_search_retains_multiple_fingerprints_reports_overflow_and_is_see
         seed=17,
         evaluator=evaluator,
         candidate_admission=plan.admits,
-        max_findings=2,
+        max_saved=2,
     )
     capped = search_cases(
         plan.cases(),
@@ -325,7 +326,7 @@ def test_schema_search_retains_multiple_fingerprints_reports_overflow_and_is_see
         seed=17,
         evaluator=evaluator,
         candidate_admission=plan.admits,
-        max_findings=1,
+        max_saved=1,
     )
     repeated = search_cases(
         plan.cases(),
@@ -333,7 +334,7 @@ def test_schema_search_retains_multiple_fingerprints_reports_overflow_and_is_see
         seed=17,
         evaluator=evaluator,
         candidate_admission=plan.admits,
-        max_findings=2,
+        max_saved=2,
     )
     assert complete is not None and capped is not None and repeated is not None
     assert len(complete.findings) == 2 and not complete.overflow

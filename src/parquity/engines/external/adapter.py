@@ -65,7 +65,7 @@ class ExternalEngine:
             self._invoke("write", arguments)
         if not path.is_file():
             raise ExternalEngineProtocolError(
-                f"{self.identity.name} reported success without writing a Parquet file"
+                f"{self.identity.name} reported success without writing a Parquet file: {path}"
             )
 
     def _invoke(self, operation: str, arguments: Sequence[str]) -> None:

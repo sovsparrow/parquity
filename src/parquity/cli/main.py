@@ -9,6 +9,8 @@ from shlex import join as shell_join
 from ..engines import (
     PYTHON_SUPPORT,
     EngineSelectionError,
+    ExternalEngineConfigurationError,
+    ExternalEngineProtocolError,
     ReaderSelection,
     discover_engines,
     resolve_engine_selection,
@@ -43,6 +45,23 @@ def _main(raw_arguments: tuple[str, ...]) -> int:
         return _dispatch(command, arguments, command_line)
     except parser.UsageError as error:
         return _configuration("usage", "USAGE_ERROR", str(error))
+    except ExternalEngineConfigurationError as error:
+        name = "parquity" if command is None else command.value
+        return _configuration(name, "EXTERNAL_ENGINE_CONFIGURATION_ERROR", str(error))
+    except ExternalEngineProtocolError as error:
+        # A bridge broke its contract. Report it instead of filing evidence that
+        # would name the wrong cause.
+        name = "parquity" if command is None else command.value
+        detail = str(error)
+        _emit(
+            {
+                "command": name,
+                "status": "INTERNAL_ERROR",
+                "error": {"kind": "EXTERNAL_ENGINE_PROTOCOL_ERROR", "detail": detail},
+            }
+        )
+        _failure(detail)
+        return 3
     except WriterProfileContractViolation as error:
         name = "parquity" if command is None else command.value
         _emit(

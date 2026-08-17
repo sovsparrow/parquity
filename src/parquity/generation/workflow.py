@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..engines import ENGINE_DESCRIPTORS, EngineSelection
+from ..engines import EngineSelection, registered_descriptors
 from ..evidence import EngineVersion, capture_environment
 from ..matrix import run_matrix
 from ..model import Case
@@ -263,7 +263,7 @@ def _engine_evidence(
     versions = {engine.name: engine.version for engine in (*writers, *readers)}
     providers = tuple(
         EngineVersion(descriptor.name, versions[descriptor.name])
-        for descriptor in ENGINE_DESCRIPTORS
+        for descriptor in registered_descriptors()
         if descriptor.name in versions
     )
     return writers, readers, providers

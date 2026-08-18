@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -16,6 +16,7 @@ from parquity.evidence import (
     engine_selection_is_valid,
     engine_versions_from_data,
     fingerprint_selection_issue,
+    normalize_detail,
     provider_inventory_matches,
     sha256_hex,
 )
@@ -263,3 +264,21 @@ def test_neutral_publication_staging_owns_creation_cleanup_and_atomic_handoff(
         assert raised.value.__cause__ is rename_error if race else raised.value is rename_error
         assert target.exists() is race
         assert not tuple(tmp_path.glob(f".{target.name}.parquity*"))
+
+
+def test_normalized_detail_is_independent_of_the_recording_platform() -> None:
+    # The normalized detail is what FailureFingerprint hashes into normalized_detail_sha256, which
+    # in turn feeds finding_id_for and ReplaySignature. Substituting the transient root leaves the
+    # rest of the path behind it, so a native separator there gives one failure two identities and
+    # evidence recorded on one platform cannot replay against another. A backslash is an ordinary
+    # character in a POSIX path, so this pins the behaviour wherever the suite runs.
+    windows = normalize_detail(
+        r"write failed at C:\parquity\run\pyarrow.parquet", (Path(r"C:\parquity\run"),)
+    )
+    posix = normalize_detail(
+        "write failed at /parquity/run/pyarrow.parquet", (PurePosixPath("/parquity/run"),)
+    )
+
+    assert windows == "write failed at <parquity-temp>/pyarrow.parquet"
+    assert posix == "write failed at <parquity-temp>/pyarrow.parquet"
+    assert sha256_hex(windows.encode()) == sha256_hex(posix.encode())

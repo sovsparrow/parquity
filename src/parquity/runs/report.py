@@ -8,6 +8,7 @@ from ..case import type_label
 from ..evidence import EngineVersion, ReplayClassification
 from ..generation.evidence import (
     CHECK_COMPLETE,
+    DISCOVERY_OVERFLOW,
     EXAMPLE_BOUND_REACHED,
     SAVED_EVIDENCE_LIMIT_REACHED,
     STRATEGY_EXHAUSTED,
@@ -79,7 +80,16 @@ def build_run_report_view(
         )
         for index, key in enumerate(keys, start=1)
     )
-    affected_inputs = {item.case_id for values in occurrences.values() for item in values}
+    # Only a DISCOVERY occurrence names an input that was evaluated. A MINIMIZATION occurrence
+    # names the reduced Case a sibling failure was first seen in, which reduction derived rather
+    # than the caller supplying or the generator producing — counting it made a `check` run, whose
+    # evaluated input is one Case, claim two affected inputs and fail its own count invariant.
+    affected_inputs = {
+        item.case_id
+        for values in occurrences.values()
+        for item in values
+        if item.origin == DISCOVERY_OVERFLOW
+    }
     return RunReportView(
         command=run.command,
         evidence_kind=EvidenceKind.GENERATED,

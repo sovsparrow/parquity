@@ -20,6 +20,7 @@ from parquity.generation.search.records import OverflowObservation
 from parquity.model import Case
 from parquity.runs import bundle, replay
 from parquity.runs.formats import v1 as model
+from parquity.runs.report import build_run_report_view
 from parquity.verdicts import CellResult, MatrixRun, Verdict
 from tests.support import generated_run as fixtures
 
@@ -108,6 +109,32 @@ def test_run_overflow_evidence_and_publication_failures(tmp_path: Path) -> None:
     with pytest.raises(bundle.RunPublicationError, match="unplanned finding"):
         bundle.publish_run(planned_source, tmp_path / "unplanned", novel_evaluator)
     assert not (tmp_path / "unplanned").exists()
+
+
+def test_report_counts_only_discovered_cases_as_affected_inputs(tmp_path: Path) -> None:
+    # A sibling failure first seen while REDUCING is recorded against the reduced Case, which no
+    # caller supplied and no generator produced. Counting that Case as an affected input made a
+    # check run -- whose evaluated input is exactly one Case -- claim two, and the report then
+    # refused to build, so the whole run exited 3 and published nothing.
+    assert fixtures.REDUCED.case_id != _CASE.case_id
+    destination = tmp_path / "sibling"
+
+    validated = bundle.publish_run(fixtures.sibling_source(), destination, _evaluate)
+
+    assert validated is not None
+    assert (destination / "REPORT.md").is_file()
+    assert {item.case_id for item in validated.run.occurrences} == {
+        _CASE.case_id,
+        fixtures.REDUCED.case_id,
+    }
+    assert {item.origin for item in validated.run.occurrences} == {
+        evidence.DISCOVERY_OVERFLOW,
+        evidence.MINIMIZATION_OVERFLOW,
+    }
+
+    view = build_run_report_view(validated)
+    assert view.evaluated_input_count == 1
+    assert view.affected_input_count == 1
 
 
 def test_run_replay_and_profile_drift(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

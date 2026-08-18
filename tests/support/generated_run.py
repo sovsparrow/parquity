@@ -7,10 +7,15 @@ import pytest
 from parquity.evidence import DependencyVersion, EngineVersion, EnvironmentEvidence
 from parquity.generation import evidence
 from parquity.generation import reduce as reduction
-from parquity.generation.search.records import OverflowObservation, SearchFinding
+from parquity.generation.search.records import (
+    GeneratedOccurrence,
+    OverflowObservation,
+    SearchFinding,
+)
 from parquity.model import Case, Field, Kind, TypeSpec
 from parquity.profiles import WriterProfileIdentity
 from parquity.runs import bundle
+from parquity.runs import source as source_model
 from parquity.runs.formats import v1 as model
 from parquity.verdicts import CellResult, MatrixRun, Verdict
 
@@ -94,6 +99,61 @@ def source(
     return bundle.RunSource(command, selected, stops, ENGINES, ENGINES, discovery, environment)
 
 
+REDUCED = Case((Field("value", TypeSpec(Kind.INT32), nullable=False),), ((7,),))
+
+
+def sibling_source() -> source_model.RunV2Source:
+    """A check run whose second finding was first seen while reducing the first.
+
+    Its occurrence is bound to the REDUCED Case, which the caller never supplied — the shape that
+    made the report count two affected inputs for a run with one evaluated input.
+    """
+    fingerprints = tuple(
+        item.fingerprint or pytest.fail("failure fingerprint missing") for item in FAILURES
+    )
+    run = MatrixRun(REDUCED.case_id, results(FAILURES), (), ENGINES, ENGINES)
+    counts = reduction.ReductionCounts(rows=1)
+
+    # The last finding is the sibling: reduction produced REDUCED while minimizing the others, and
+    # this failure was seen there first.
+    findings = tuple(
+        SearchFinding(
+            *((REDUCED, REDUCED) if index == len(FAILURES) - 1 else (CASE, CASE)),
+            fingerprints[index],
+            FAILURES[index],
+            run,
+            0,
+            False,
+            counts,
+        )
+        for index in range(len(FAILURES))
+    )
+    occurrences = tuple(
+        GeneratedOccurrence(
+            REDUCED.case_id if index == len(FAILURES) - 1 else CASE.case_id,
+            fingerprints[index],
+            evidence.MINIMIZATION_OVERFLOW
+            if index == len(FAILURES) - 1
+            else evidence.DISCOVERY_OVERFLOW,
+        )
+        for index in range(len(FAILURES))
+    )
+    return source_model.RunV2Source(
+        command="check",
+        findings=findings,
+        overflow=(),
+        writers=ENGINES,
+        readers=ENGINES,
+        discovery=CHECK,
+        environment=EnvironmentEvidence(
+            "0.1.0", "h", "3", "x", ENGINES, (DependencyVersion("pyarrow", "1"),)
+        ),
+        occurrences=occurrences,
+        evaluated_inputs=1,
+        executed_checks=9,
+    )
+
+
 def published_run(
     root: Path,
     name: str = "run",
@@ -116,10 +176,12 @@ __all__ = [
     "CHECK",
     "ENGINES",
     "FAILURES",
+    "REDUCED",
     "evaluate",
     "finding",
     "pass_result",
     "published_run",
     "results",
+    "sibling_source",
     "source",
 ]

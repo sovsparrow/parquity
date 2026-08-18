@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import PurePath
 from typing import TYPE_CHECKING, Self, cast
 
 from .. import evidence
@@ -217,7 +217,7 @@ class CellResult:
             data["difference"] = self.difference.to_data()
         return data
 
-    def normalized(self, transient_roots: tuple[Path, ...]) -> Self:
+    def normalized(self, transient_roots: tuple[PurePath, ...]) -> Self:
         detail = evidence.normalize_detail(self.detail, transient_roots)
         if detail == self.detail:
             return self

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import PurePath
 from typing import NamedTuple
 
 from .digests import sha256_hex
@@ -33,7 +33,7 @@ def bounded_detail(value: object) -> str:
     return " ".join(str(value).split())[:500]
 
 
-def normalize_detail(detail: str, transient_roots: tuple[Path, ...] = ()) -> str:
+def normalize_detail(detail: str, transient_roots: tuple[PurePath, ...] = ()) -> str:
     normalized = detail
     roots = sorted({str(path) for path in transient_roots}, key=len, reverse=True)
     for root in roots:

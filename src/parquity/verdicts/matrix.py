@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Protocol
 
 from .. import evidence
@@ -60,7 +60,7 @@ class MatrixRun:
                 return path
         return None
 
-    def normalized(self, transient_roots: tuple[Path, ...]) -> MatrixRun:
+    def normalized(self, transient_roots: tuple[PurePath, ...]) -> MatrixRun:
         return MatrixRun(
             self.case_id,
             tuple(result.normalized(transient_roots) for result in self.results),

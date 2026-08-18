@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from enum import StrEnum
 from importlib import import_module
 from pathlib import Path
@@ -50,6 +51,8 @@ class _FileMetadata(Protocol):
 
 class _ParquetFile(Protocol):
     metadata: _FileMetadata
+
+    def close(self) -> None: ...
 
 
 class _ParquetFileFactory(Protocol):
@@ -106,7 +109,17 @@ def verify_writer_profile_artifact(
         raise WriterProfileContractViolation(
             profile.name, "artifact footer could not be verified"
         ) from error
-    return _verify_metadata(artifact.metadata, profile, expected_rows)
+    # Closed before returning, and before any violation propagates: a failed contract makes the
+    # caller delete the artifact it just wrote, and Windows refuses to unlink a file that is still
+    # open. Leaving the handle to the garbage collector turned every contract violation there into
+    # a PermissionError naming the wrong problem.
+    try:
+        return _verify_metadata(artifact.metadata, profile, expected_rows)
+    finally:
+        # Suppressed so that a failure to release the handle cannot replace the verdict, or the
+        # violation, that the caller actually needs.
+        with suppress(OSError):
+            artifact.close()
 
 
 def admit_writer_profile_plan(

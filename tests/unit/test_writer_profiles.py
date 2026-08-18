@@ -291,7 +291,14 @@ def test_artifact_verifier_distinguishes_invalid_artifacts_from_internal_failure
             contracts.verify_writer_profile_artifact(malformed, profile, 4)
         assert propagated.value is failure
     metadata_failure = AttributeError("metadata access failure")
-    artifact = type("Artifact", (), {"metadata": PropertyMock(side_effect=metadata_failure)})()
+
+    class _Artifact:
+        metadata = PropertyMock(side_effect=metadata_failure)
+
+        def close(self) -> None:
+            return None
+
+    artifact = _Artifact()
     monkeypatch.setattr(pq, "ParquetFile", Mock(return_value=artifact))
     with pytest.raises(AttributeError) as propagated:
         contracts.verify_writer_profile_artifact(malformed, profile, 4)
@@ -342,3 +349,40 @@ def test_admission_controls_are_fixed_fresh_and_cleaned(monkeypatch: pytest.Monk
     assert contracts.admit_writer_profile_plan(declared, (writer,)) == declared
     assert len(paths) == len(set(paths)) == len(PROFILE_REGISTRY)
     assert all(not path.exists() for path in paths)
+
+
+def test_artifact_verifier_releases_its_handle_on_both_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A contract violation makes the caller delete the artifact it just wrote. An operating system
+    # that refuses to unlink an open file then reports that refusal instead of the violation, so the
+    # handle has to be released before the failure propagates -- and the traceback keeps the frame,
+    # and therefore the artifact, alive exactly on that path. Asserted rather than left to the
+    # garbage collector, since where unlinking an open file succeeds the leak is invisible.
+    profile = WriterProfileIdentity("compression-gzip", {"compression": "gzip"})
+    artifact = tmp_path / "artifact.parquet"
+    adapter = PyArrowEngine(EngineIdentity("pyarrow", "controlled"))
+    adapter.write_profiled(pa.table({"value": [1, 2, 3, 4]}), artifact, profile)
+
+    class _Spy:
+        def __init__(self, path: Path) -> None:
+            self._inner = pq.ParquetFile(path)
+            self.closed = 0
+
+        @property
+        def metadata(self) -> object:
+            return self._inner.metadata
+
+        def close(self) -> None:
+            self.closed += 1
+            self._inner.close()
+
+    for expected_rows, violates in ((4, False), (7, True)):
+        opened = _Spy(artifact)
+        monkeypatch.setattr(pq, "ParquetFile", Mock(return_value=opened))
+        if violates:
+            with pytest.raises(contracts.WriterProfileContractViolation):
+                contracts.verify_writer_profile_artifact(artifact, profile, expected_rows)
+        else:
+            contracts.verify_writer_profile_artifact(artifact, profile, expected_rows)
+        assert opened.closed == 1

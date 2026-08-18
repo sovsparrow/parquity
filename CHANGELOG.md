@@ -7,6 +7,16 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-18
+
+### Fixed
+
+- Publish a `check` run whose reduction discovers a sibling failure.
+- Normalize path separators in recorded diagnostics so one failure keeps one
+  identity on every platform.
+- Release the writer-profile artifact handle before a contract violation
+  propagation.
+
 ## [0.2.0] - 2026-08-12
 
 ### Added

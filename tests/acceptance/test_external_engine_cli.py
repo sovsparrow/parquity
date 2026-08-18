@@ -189,3 +189,33 @@ def test_a_finding_records_the_probed_version_and_a_portable_reproducer(
     # reproducer resolves it from the environment instead of embedding it.
     assert str(bridge.BRIDGE) not in source
     assert str(bridge.BRIDGE.parent) not in source
+
+
+def test_a_timeout_is_reported_where_the_remedy_is_and_saves_no_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A bridge that never answers says nothing about the implementation, so the run must not record
+    # a finding against it -- otherwise a slow machine invents defects. It is reported against the
+    # setting that fixes it instead.
+    bridge.configure(monkeypatch, tmp_path, bridge.declaration(timeout_seconds=1))
+    bridge.fault(monkeypatch, "slow")
+    destination = tmp_path / "out"
+    arguments = [
+        "check",
+        str(_case(tmp_path)),
+        "--writers",
+        bridge.NAME,
+        "--readers",
+        bridge.NAME,
+        "--out",
+        str(destination),
+        "--json",
+    ]
+
+    assert cli.main(arguments) == 2
+    payload, _ = captured_payload(capsys)
+    assert payload["status"] == "CONFIGURATION_ERROR"
+    error = cast(dict[str, object], payload["error"])
+    assert error["kind"] == "EXTERNAL_ENGINE_TIMEOUT"
+    assert "did not answer" in cast(str, error["detail"])
+    assert "finding_count" not in payload and not destination.exists()

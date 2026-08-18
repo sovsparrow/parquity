@@ -132,6 +132,9 @@ failure. Neither stream may exceed 64 KiB. Stdin is closed.
 | 2 | `{"status":"ERROR","kind":"...","detail":"..."}` | The bridge rejected Parquity's request: unknown operation, missing argument, undeclared profile. | Protocol error — the run stops. |
 | other | any | The process crashed, was killed, or exited without a well-formed response. | Provider failure — evidence, as `ExternalEngineCrash`. |
 
+A bridge that does not answer within its timeout is neither: nothing was observed about
+the implementation, so the run stops rather than recording a finding against it.
+
 The split between exit 1 and exit 2 is the point of the contract. Exit 1 says
 "this implementation cannot handle these bytes", which is exactly the
 observation Parquity exists to record. Exit 2 says "Parquity asked for
@@ -143,15 +146,28 @@ stops loudly rather than recording a finding that names the wrong cause.
 `kind` is recorded as the diagnostic kind and contributes to finding identity,
 so it should be the implementation's own error class — `ParquetFormatException`,
 `ArrowTypeError` — not a generic label. It must be a non-empty identifier of at
-most 64 characters. An operation that exceeds its timeout is recorded as a
-provider failure with kind `ExternalEngineTimeout`.
+most 64 characters.
+
+A timeout is deliberately not a provider failure. Exit 1 means the
+implementation answered and said it failed, which is the observation Parquity
+records; a timeout means it never answered, so there is nothing to record about
+it, and treating the two alike would let a slow machine manufacture findings
+against an engine that did nothing wrong. The run stops with
+`EXTERNAL_ENGINE_TIMEOUT`, reported against the `timeout_seconds` that fixes it.
+
+A crash is treated as evidence, unlike a timeout: a process that dies on a
+particular input has told you something about the implementation.
 
 ## Evidence and replay
 
-Evidence records the engine name, the version reported by `info`, and the
-bridge protocol identity. It never records the configured command, which is a
-local path that would not survive being shared and could disclose a filesystem
-layout.
+Evidence records the engine name and the version reported by `info` — the same
+two fields, in the same place, as any provider discovered through Python
+metadata, so nothing about the run format changes to accommodate an external
+engine. The protocol identity is checked at probe time but not stored; a run
+that produced evidence necessarily spoke the protocol.
+
+It never records the configured command, which is a local path that would not
+survive being shared and could disclose a filesystem layout.
 
 Replay therefore resolves the command from the local configuration and compares
 the freshly probed version with the recorded one, reporting version drift the

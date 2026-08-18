@@ -7,7 +7,11 @@ import pytest
 
 from parquity.engines import resolve_engine
 from parquity.engines.base import EngineReader, EngineWriter, ProviderOperationError
-from parquity.engines.external.protocol import CRASH_KIND, TIMEOUT_KIND, ExternalEngineProtocolError
+from parquity.engines.external.protocol import (
+    CRASH_KIND,
+    ExternalEngineProtocolError,
+    ExternalEngineTimeout,
+)
 from parquity.profiles import WriterProfileIdentity
 from parquity.profiles.contracts import ProfiledEngineWriter
 from tests.support import external_engine as bridge
@@ -122,19 +126,22 @@ def test_a_crash_is_evidence_because_the_implementation_still_failed(
     assert caught.value.provider_type == CRASH_KIND
 
 
-def test_an_operation_that_exceeds_its_timeout_is_evidence(
+def test_an_operation_that_exceeds_its_timeout_is_not_a_provider_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Exit 1 means the implementation answered and said it failed, which is worth recording. A
+    # timeout means it never answered, so there is nothing to record -- and treating the two alike
+    # would let a slow machine manufacture findings against an engine that did nothing wrong.
     bridge.configure(monkeypatch, tmp_path, bridge.declaration(timeout_seconds=1))
     writer = resolve_engine(bridge.NAME).writer
     assert writer is not None
     bridge.fault(monkeypatch, "slow")
 
-    with pytest.raises(ProviderOperationError) as caught:
+    with pytest.raises(ExternalEngineTimeout) as caught:
         writer.write(TABLE, tmp_path / "artifact.parquet")
 
-    assert caught.value.provider_type == TIMEOUT_KIND
-    assert "exceeded 1 seconds" in caught.value.detail
+    assert not isinstance(caught.value, ProviderOperationError)
+    assert "within 1 seconds" in str(caught.value)
 
 
 def test_a_reading_bridge_that_cannot_be_read_from_stops_the_run(

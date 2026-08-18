@@ -12,7 +12,12 @@ from .config import (
     configured_specs,
 )
 from .process import BridgeUnavailableError, diagnostic, run_bridge
-from .protocol import BridgeInfo, ExternalEngineProtocolError, parse_info
+from .protocol import (
+    BridgeInfo,
+    ExternalEngineProtocolError,
+    ExternalEngineTimeout,
+    parse_info,
+)
 
 EXTERNAL_TIER = "external"
 _ADAPTER_MODULE = "parquity.engines.external.adapter"
@@ -93,6 +98,7 @@ __all__ = [
     "ExternalEngineConfigurationError",
     "ExternalEngineProtocolError",
     "ExternalEngineSpec",
+    "ExternalEngineTimeout",
     "ExternalRegistration",
     "external_registration",
     "external_registrations",

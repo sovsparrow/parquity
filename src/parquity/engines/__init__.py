@@ -10,6 +10,7 @@ from .external import (
     EXTERNAL_TIER,
     ExternalEngineConfigurationError,
     ExternalEngineProtocolError,
+    ExternalEngineTimeout,
     ExternalRegistration,
     external_registrations,
 )
@@ -416,6 +417,7 @@ __all__ = [
     "EngineWriter",
     "ExternalEngineConfigurationError",
     "ExternalEngineProtocolError",
+    "ExternalEngineTimeout",
     "ExternalRegistration",
     "ReaderSelection",
     "default_engine_names",

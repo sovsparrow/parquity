@@ -11,7 +11,6 @@ from ...profiles import PROFILE_REGISTRY, OptionValue
 BRIDGE_PROTOCOL = "parquity.bridge.v1"
 MAX_STREAM_BYTES = 64 * 1024
 MAX_KIND_LENGTH = 64
-TIMEOUT_KIND = "ExternalEngineTimeout"
 CRASH_KIND = "ExternalEngineCrash"
 _KIND_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 _INFO_KEYS = frozenset({"protocol", "engine", "version", "directions", "writer_profiles"})
@@ -23,6 +22,16 @@ ProfileOptions: TypeAlias = Mapping[str, OptionValue]
 
 class ExternalEngineProtocolError(RuntimeError):
     """A bridge broke the contract. This is an integration defect, not evidence."""
+
+
+class ExternalEngineTimeout(RuntimeError):
+    """A bridge did not answer in time.
+
+    Deliberately not a provider failure. Exit 1 means the implementation answered and said it
+    failed, which is an observation worth recording; a timeout means it never answered, so there is
+    nothing to record about it. Treating the two alike would let a slow machine manufacture findings
+    against an engine that did nothing wrong.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,10 +155,10 @@ __all__ = [
     "CRASH_KIND",
     "MAX_KIND_LENGTH",
     "MAX_STREAM_BYTES",
-    "TIMEOUT_KIND",
     "BridgeFailure",
     "BridgeInfo",
     "ExternalEngineProtocolError",
+    "ExternalEngineTimeout",
     "kind_is_valid",
     "parse_failure",
     "parse_info",

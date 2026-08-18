@@ -13,9 +13,9 @@ from .config import ExternalEngineSpec
 from .process import BridgeUnavailableError, diagnostic, run_bridge
 from .protocol import (
     CRASH_KIND,
-    TIMEOUT_KIND,
     BridgeInfo,
     ExternalEngineProtocolError,
+    ExternalEngineTimeout,
     parse_failure,
     parse_success,
 )
@@ -76,11 +76,14 @@ class ExternalEngine:
         except BridgeUnavailableError as error:
             raise ExternalEngineProtocolError(str(error)) from error
         if outcome.timed_out:
-            raise self._failure(
-                operation,
-                TIMEOUT_KIND,
-                f"{operation} exceeded {self.spec.timeout_seconds} seconds",
-                outcome.stderr,
+            # Not a provider failure: the bridge never answered, so nothing was observed about the
+            # implementation. Recording a finding here would blame an engine for a slow machine.
+            raise ExternalEngineTimeout(
+                diagnostic(
+                    f"{self.identity.name} did not answer the {operation} request within "
+                    f"{self.spec.timeout_seconds} seconds",
+                    outcome.stderr,
+                )
             )
         if outcome.exit_code == 0:
             parse_success(outcome.stdout)

@@ -73,6 +73,14 @@ reader sets recorded with the evidence and refuses to evaluate a smaller
 matrix.
 See [Evidence](evidence.md) for replay states and exits.
 
+## Implementations without a Python provider
+
+An implementation that ships no Python distribution can still take part, by
+answering a small subprocess contract instead of being imported. Those engines
+are declared explicitly, never join the default matrix, and produce evidence
+handled the same way as any other provider. See
+[External engines](external-engines.md).
+
 ## Writer options
 
 Writer directions can also be evaluated under the bounded profiles in

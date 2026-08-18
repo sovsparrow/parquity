@@ -13,12 +13,20 @@ class DetailRule(NamedTuple):
     replacement: str
 
 
+TEMPORARY_ROOT = "<parquity-temp>"
+
 DETAIL_RULES_V1 = (
     DetailRule(
         "temporary-root-separator", re.compile(r"<parquity-temp>[/\\]+"), "<parquity-temp>/"
     ),
     DetailRule("whitespace", re.compile(r"\s+"), " "),
 )
+
+# What remains of a substituted transient root is the rest of the path, still spelled with the
+# platform's own separator. Since the normalized detail is what the fingerprint hashes, leaving it
+# native gives the same failure two identities — one on Windows, one everywhere else — so evidence
+# recorded on one platform cannot be replayed against the other.
+_TEMPORARY_PATH = re.compile(re.escape(TEMPORARY_ROOT) + r"\S*")
 
 
 def bounded_detail(value: object) -> str:
@@ -29,7 +37,8 @@ def normalize_detail(detail: str, transient_roots: tuple[Path, ...] = ()) -> str
     normalized = detail
     roots = sorted({str(path) for path in transient_roots}, key=len, reverse=True)
     for root in roots:
-        normalized = normalized.replace(root, "<parquity-temp>")
+        normalized = normalized.replace(root, TEMPORARY_ROOT)
+    normalized = _TEMPORARY_PATH.sub(lambda match: match.group().replace("\\", "/"), normalized)
     return " ".join(normalized.split())
 
 

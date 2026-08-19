@@ -61,8 +61,7 @@ without choosing a reference reader.
 ## Install
 
 Parquity requires Python 3.11 and currently supports Python 3.11 through 3.14.
-It supports Linux and macOS. Windows is not currently supported; `scan` and
-replay of scan evidence require POSIX process-group supervision.
+It supports Linux, macOS, and Windows.
 
 ```console
 python -m pip install parquity

@@ -334,3 +334,54 @@ def test_a_job_contains_a_descendant_and_terminating_it_reaches_the_whole_tree()
         child.wait(timeout=5)
     finally:
         job.close()
+
+
+@pytest.mark.skipif(not windows.IS_WINDOWS, reason="job containment is the Windows path")
+def test_worker_is_contained_before_it_runs_any_of_its_own_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Assigning a running process leaves a window in which anything it starts is created outside
+    # the job. The worker is created suspended instead, so by the time it is resumed the job
+    # already holds it.
+    #
+    # The assertion is on the suspend count rather than on the worker having produced nothing yet:
+    # an interpreter takes long enough to start that the directory is empty either way, so that
+    # version of this test passed with the flag removed and proved nothing.
+    private = tmp_path / "worker"
+    observed: list[tuple[int, tuple[str, ...]]] = []
+    original = process_module.windows.resume_process
+
+    def observing_resume(pid: int) -> int:
+        suspended = original(pid)
+        observed.append((suspended, tuple(sorted(path.name for path in private.iterdir()))))
+        return suspended
+
+    monkeypatch.setattr(process_module.windows, "resume_process", observing_resume)
+    assert _run("success", tmp_path).kind == "SUCCESS"
+    # One thread, found suspended, having written nothing.
+    assert observed == [(1, ())]
+
+
+@pytest.mark.skipif(not windows.IS_WINDOWS, reason="job containment is the Windows path")
+def test_a_refused_assignment_stops_rather_than_supervising_an_uncontained_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Carrying on would supervise a worker the job does not hold, and a timeout would then
+    # terminate an empty job and report the tree gone while it is still running.
+    def refuse(self: windows.ProcessJob, pid: int) -> bool:
+        del self, pid
+        return False
+
+    resumed: list[int] = []
+
+    def recording_resume(pid: int) -> int:
+        resumed.append(pid)
+        return 1
+
+    monkeypatch.setattr(windows.ProcessJob, "assign", refuse)
+    monkeypatch.setattr(process_module.windows, "resume_process", recording_resume)
+    with pytest.raises(WorkerInternalError) as refused:
+        _run("success", tmp_path)
+    assert "containment" in str(refused.value)
+    assert not resumed, "a worker that was never contained must not be started"
+    assert not (tmp_path / "worker").exists()

@@ -44,11 +44,6 @@ job object, which also takes the tree down if the supervisor itself dies. Scan
 admission likewise refuses to follow a symlink into a file it was not given,
 through `O_NOFOLLOW` or `FILE_FLAG_OPEN_REPARSE_POINT`.
 
-One difference is visible in the evidence. POSIX asks a worker tree to stop
-before killing it, and records that as a termination; Windows has no polite
-equivalent for a tree, so a timed-out worker there is recorded as killed
-outright.
-
 ## Execution model
 
 `check`, `fuzz`, `smoke`, and replay of generated evidence load providers in

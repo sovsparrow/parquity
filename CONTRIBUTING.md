@@ -91,7 +91,10 @@ A test that needs to create a symlink must first ask
 `tests.support.symlinks_available` and skip when it cannot, rather than assume
 the filesystem will allow one. Windows refuses without Developer Mode or
 elevation, so running the suite there without either reports a handful of skips
-that CI does not.
+that CI does not. Turning Developer Mode on runs them, which is worth doing:
+it is a single switch in Windows settings, many developers already have it on,
+and the probe means the choice changes what is covered rather than whether the
+suite passes.
 
 ## Documentation changes
 

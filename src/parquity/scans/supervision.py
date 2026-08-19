@@ -273,8 +273,9 @@ class _Supervised:
 
 
 def _spawn(argv: Sequence[str]) -> _Supervised:
-    job = windows.ProcessJob() if windows.IS_WINDOWS else None
+    job = None
     try:
+        job = windows.ProcessJob() if windows.IS_WINDOWS else None
         process = subprocess.Popen(  # noqa: S603 - caller supplies a shell-free worker argv.
             list(argv),
             stdin=subprocess.DEVNULL,
@@ -286,17 +287,58 @@ def _spawn(argv: Sequence[str]) -> _Supervised:
             # on Windows keeps a console signal aimed at this process from reaching the worker,
             # where containment itself is the job object's job.
             start_new_session=not windows.IS_WINDOWS,
-            creationflags=windows.CREATE_NEW_PROCESS_GROUP if windows.IS_WINDOWS else 0,
+            creationflags=_creation_flags(),
         )
     except OSError as error:
         if job is not None:
             job.close()
         raise WorkerInternalError("worker process could not be started") from error
-    if job is not None:
-        # Assigned as soon as the process exists. The worker cannot have started anything of its
-        # own yet -- it has not finished loading an interpreter -- so nothing escapes the job.
-        job.assign(process.pid)
+    if job is None:
+        return _Supervised(process, None)
+    return _contain(process, job)
+
+
+def _creation_flags() -> int:
+    if not windows.IS_WINDOWS:
+        return 0
+    # Suspended, so that the worker exists -- and can therefore be placed in the job -- before it
+    # has run any code of its own. Assigning a running process leaves a window in which anything
+    # it starts is created outside the job, and POSIX has no equivalent window because
+    # start_new_session is applied as part of starting the process rather than after it.
+    return windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED
+
+
+def _contain(process: subprocess.Popen[bytes], job: windows.ProcessJob) -> _Supervised:
+    """Places a suspended worker in its job and starts it, or leaves nothing behind."""
+    try:
+        if not job.assign(process.pid):
+            # The worker is suspended, so it cannot have exited and cannot have started anything.
+            # A refusal here is a real failure to contain, and continuing would supervise a worker
+            # the job does not hold: a timeout would terminate an empty job and then report the
+            # tree gone while it is still running.
+            raise WorkerInternalError("worker could not be placed in its containment job")
+        if not windows.resume_process(process.pid):
+            # Zero means no thread was found suspended, so the worker had already been running
+            # while it was being assigned -- the very window creating it suspended exists to
+            # close. Refusing here keeps that guarantee checked rather than assumed.
+            raise WorkerInternalError("worker was not suspended while it was being contained")
+    except BaseException:
+        _discard(process)
+        job.close()
+        raise
     return _Supervised(process, job)
+
+
+def _discard(process: subprocess.Popen[bytes]) -> None:
+    """Kills a worker that was never contained, and closes what was opened for it."""
+    with suppress(OSError):
+        process.kill()
+    with suppress(OSError, subprocess.TimeoutExpired):
+        process.wait(timeout=TERMINATION_GRACE_SECONDS)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            with suppress(OSError):
+                stream.close()
 
 
 def _wait_for_process(child: _Supervised, timeout: int) -> tuple[int, bool, bool, bool]:

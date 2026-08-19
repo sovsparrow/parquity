@@ -26,6 +26,7 @@ from parquity.findings.replay import replay_validated_bundle as replay
 from parquity.generation.evidence import CHECK_COMPLETE, DiscoveryEvidence
 from parquity.model import Case, Field, Kind, TypeSpec
 from parquity.verdicts import CellResult, MatrixRun, Verdict
+from tests.support import symlinks_available
 
 Capability = wp.WriterProfileCapability
 
@@ -208,7 +209,11 @@ def test_publication_refuses_existing_targets_before_evaluation(tmp_path: Path) 
 
 def test_invalid_payload_shapes_fail_validation(tmp_path: Path) -> None:
     mutations = ("missing", "missing-manifest", "extra")
-    mutations += ("report", "noncanonical", "nested", "symlink")
+    mutations += ("report", "noncanonical", "nested")
+    if symlinks_available(tmp_path):
+        # Windows refuses to create one without Developer Mode or elevation, and the mutation is
+        # about what validation rejects rather than about what the filesystem will let a test build.
+        mutations += ("symlink",)
     for mutation in mutations:
         destination = tmp_path / mutation
         _build(destination)
@@ -217,17 +222,17 @@ def test_invalid_payload_shapes_fail_validation(tmp_path: Path) -> None:
         elif mutation == "missing-manifest":
             (destination / "finding.json").unlink()
         elif mutation == "extra":
-            (destination / "extra.txt").write_text("extra")
+            (destination / "extra.txt").write_text("extra", encoding="utf-8")
         elif mutation == "report":
             (destination / "REPORT.md").write_bytes(b"# unsealed tamper\n")
         elif mutation == "noncanonical":
             path = destination / "finding.json"
-            path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2))
+            path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2), encoding="utf-8")
         elif mutation == "nested":
             (destination / "nested").mkdir()
         else:
             external = tmp_path / "external.md"
-            external.write_text("external")
+            external.write_text("external", encoding="utf-8")
             (destination / "REPORT.md").unlink()
             (destination / "REPORT.md").symlink_to(external)
         with pytest.raises(BundleValidationError) as caught:

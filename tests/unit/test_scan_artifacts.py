@@ -12,6 +12,7 @@ from parquity.scans import bundle, records
 from parquity.scans.differences import DifferenceKind
 from parquity.scans.observations import ObservationDifference, ObservationGroup
 from parquity.scans.records import SCAN_ARTIFACTS, ReaderOutcomeKind, ReaderOutcomeRecord
+from tests.support import symlinks_available
 
 _CHILD_TAMPERS = _words("input manifest path symlink extra")
 _RUN_TAMPERS = _words("child extra total-bool")
@@ -150,8 +151,8 @@ def test_scan_child_is_canonical_standalone_and_binds_complete_evidence(tmp_path
         artifact_payload = (child / cast(str, artifact["path"])).read_bytes()
         observed = (len(artifact_payload), hashlib.sha256(artifact_payload).hexdigest())
         assert (artifact["bytes"], artifact["sha256"]) == observed
-    assert "sys.executable" in (child / "reproduce.py").read_text()
-    assert "parquity" not in (child / "upstream_repro.py").read_text().lower()
+    assert "sys.executable" in (child / "reproduce.py").read_text(encoding="utf-8")
+    assert "parquity" not in (child / "upstream_repro.py").read_text(encoding="utf-8").lower()
     assert str(tmp_path) not in payload.decode()
 
 
@@ -195,6 +196,8 @@ def test_scan_run_binds_children_and_standalone_copy(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("tamper", _CHILD_TAMPERS)
 def test_scan_child_tampering_is_rejected(tmp_path: Path, tamper: str) -> None:
+    if tamper == "symlink" and not symlinks_available(tmp_path):
+        pytest.skip("creating a symlink requires a privilege this environment lacks")
     child = _publish_finding(tmp_path / tamper)
     if tamper == "input":
         target = child / "input.parquet"
@@ -203,7 +206,7 @@ def test_scan_child_tampering_is_rejected(tmp_path: Path, tamper: str) -> None:
         path = child / "finding.json"
         document = cast(dict[str, object], json.loads(path.read_bytes()))
         if tamper == "manifest":
-            path.write_text(json.dumps(document, indent=2))
+            path.write_text(json.dumps(document, indent=2), encoding="utf-8")
         else:
             cast(list[dict[str, object]], document["artifacts"])[0]["path"] = "../REPORT.md"
             path.write_bytes(_canonical(document))
@@ -212,7 +215,7 @@ def test_scan_child_tampering_is_rejected(tmp_path: Path, tamper: str) -> None:
         report.unlink()
         report.symlink_to(child / "input.parquet")
     else:
-        (child / "unexpected").write_text("extra")
+        (child / "unexpected").write_text("extra", encoding="utf-8")
     with pytest.raises(bundle.ScanBundleError):
         bundle.validate_finding(child)
 

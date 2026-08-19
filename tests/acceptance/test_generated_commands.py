@@ -166,7 +166,7 @@ def test_check_and_replay(
     validated = validate_run(destination)
     assert isinstance(validated, ValidatedRunV2)
     _assert_v2_partition(validated)
-    report = (destination / "REPORT.md").read_text()
+    report = (destination / "REPORT.md").read_text(encoding="utf-8")
     assert (
         "3 of 7 engine paths failed on the supplied table. A reproducer was saved for each."
         in report
@@ -182,7 +182,7 @@ def test_check_and_replay(
     assert sum(line.startswith("| ") for line in failure_rows.splitlines()) - 1 == 3
     assert "polars (write)" in failure_rows and "[open](" in failure_rows
     assert all((child.directory / "REPORT.md").read_bytes() for child in validated.children)
-    child_report = validated.children[0].directory.joinpath("REPORT.md").read_text()
+    child_report = validated.children[0].directory.joinpath("REPORT.md").read_text(encoding="utf-8")
     assert child_report.startswith("# pyarrow → pyarrow · compare · VALUE\\_MISMATCH")
     assert "**Table provenance:** Supplied table; no Hypothesis shrink;" in child_report
     assert "canonical table" in child_report and "canonical Input" not in child_report
@@ -307,7 +307,7 @@ def test_fuzz_evidence(
     validated = validate_run(destination)
     assert isinstance(validated, ValidatedRunV2)
     _assert_v2_partition(validated)
-    report = (destination / "REPORT.md").read_text()
+    report = (destination / "REPORT.md").read_text(encoding="utf-8")
     expected_command = shell_join(("parquity", *arguments))
     assert report.count("```console") == 1
     assert f"```console\n{expected_command}\n```" in report
@@ -321,14 +321,14 @@ def test_fuzz_evidence(
     failure_rows = report.split("## Failures", 1)[1].split("## Run details", 1)[0]
     assert sum(line.startswith("| ") for line in failure_rows.splitlines()) - 1 == 3
     assert "Seen on 4 generated tables" in failure_rows
-    child_report = validated.children[0].directory.joinpath("REPORT.md").read_text()
+    child_report = validated.children[0].directory.joinpath("REPORT.md").read_text(encoding="utf-8")
     assert "**Table provenance:** Generated table;" in child_report
     assert "Hypothesis shrink" in child_report
     assert (
         "**Repeated:** Seen on 4 generated tables; this reproducer uses one of them" in child_report
     )
     empty_reports = tuple(
-        child.directory.joinpath("REPORT.md").read_text()
+        child.directory.joinpath("REPORT.md").read_text(encoding="utf-8")
         for child in validated.children
         if not child.case.rows
     )
@@ -348,7 +348,7 @@ def test_cli_failure_exits(
     monkeypatch: MonkeyPatch, capsys: CaptureFixture[str], tmp_path: Path
 ) -> None:
     invalid = tmp_path / "invalid.json"
-    invalid.write_text('{"format":"different"}')
+    invalid.write_text('{"format":"different"}', encoding="utf-8")
     assert cli.main(["check", str(invalid), "--out", str(tmp_path / "invalid-run")]) == 2
     invalid_payload, invalid_stderr = _payload(capsys)
     invalid_error = cast(dict[str, object], invalid_payload["error"])
@@ -372,16 +372,16 @@ def test_cli_failure_exits(
         (tmp_path / "unreadable-finding", "finding.json could not be read"),
         (tmp_path / "unsupported-finding", "finding format is not supported"),
     )
-    replay_inputs[1][0].write_text("not a directory")
+    replay_inputs[1][0].write_text("not a directory", encoding="utf-8")
     replay_inputs[2][0].mkdir()
     for index, payloads in ((3, ("run.json", "scan.json")), (4, ("finding.json",))):
         replay_inputs[index][0].mkdir()
         for name in payloads:
-            (replay_inputs[index][0] / name).write_text("{")
+            (replay_inputs[index][0] / name).write_text("{", encoding="utf-8")
     replay_inputs[5][0].mkdir()
     (replay_inputs[5][0] / "finding.json").mkdir()
     replay_inputs[6][0].mkdir()
-    (replay_inputs[6][0] / "finding.json").write_text('{"format":"unknown"}')
+    (replay_inputs[6][0] / "finding.json").write_text('{"format":"unknown"}', encoding="utf-8")
     main_module = import_module("parquity.cli.main")
 
     def unexpected_selection(*_: object) -> object:
@@ -403,7 +403,7 @@ def test_cli_failure_exits(
     assert cli.main(["check", str(case_path), "--out", str(destination)]) == 1
     _payload(capsys)
     child = next((destination / "findings").iterdir())
-    (child / "REPORT.md").write_text("tampered")
+    (child / "REPORT.md").write_text("tampered", encoding="utf-8")
     assert cli.main(["replay", str(destination)]) == 2
     tampered, _ = _payload(capsys)
     assert cast(dict[str, object], tampered["error"])["kind"] == "INVALID_BUNDLE"

@@ -87,6 +87,12 @@ code around coherent responsibilities.
 Tests that exercise child processes must use bounded programs and reliable
 readiness signals. Test real provider behavior with the provider installed.
 
+A test that needs to create a symlink must first ask
+`tests.support.symlinks_available` and skip when it cannot, rather than assume
+the filesystem will allow one. Windows refuses without Developer Mode or
+elevation, so running the suite there without either reports a handful of skips
+that CI does not.
+
 ## Documentation changes
 
 Update `README.md` when the overview or quickstart changes. Put detailed

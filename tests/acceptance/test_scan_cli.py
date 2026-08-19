@@ -135,16 +135,16 @@ def test_scan_saved_limit_publishes_scripts_and_replays(
     assert published["affected_input_count"] == view.affected_input_count
     child = run.children[0].directory
     _assert_published_scan_reports(destination, child)
-    report = (destination / "REPORT.md").read_text()
+    report = (destination / "REPORT.md").read_text(encoding="utf-8")
     assert report.count("```console") == 1
     assert f"```console\n{shell_join(('parquity', *arguments))}\n```" in report
     assert all(value not in report for value in ("CASE_FILE", "FILE_OR_DIR", "OUTPUT_DIR"))
     assert b"```console" not in render_run_report(view)
     assert cast(list[str], run.record.data["overflow"]) == ["b.parquet"]
     assert cast(dict[str, object], run.record.data["limits"])["max_visited_entries"] == 4096
-    assert str(tmp_path) not in (destination / "scan.json").read_text()
+    assert str(tmp_path) not in (destination / "scan.json").read_text(encoding="utf-8")
     for relative in ("finding.json", "REPORT.md", "reproduce.py", "upstream_repro.py"):
-        assert str(tmp_path) not in (child / relative).read_text()
+        assert str(tmp_path) not in (child / relative).read_text(encoding="utf-8")
     standalone = tmp_path / "standalone"
     shutil.copytree(child, standalone)
     assert cli.main(["replay", str(standalone)]) == 1
@@ -178,7 +178,7 @@ def test_scan_saved_limit_publishes_scripts_and_replays(
 
 
 def _assert_published_scan_reports(destination: Path, child: Path) -> None:
-    report = (destination / "REPORT.md").read_text()
+    report = (destination / "REPORT.md").read_text(encoding="utf-8")
     assert (
         "Parquity scanned 1 file and found 3 distinct failures. It stopped after saving "
         "1 file for reproduction; 1 more file was not scanned." in report
@@ -187,7 +187,7 @@ def _assert_published_scan_reports(destination: Path, child: Path) -> None:
     assert "**Python:**" in report and "**Platform:**" in report
     assert "| Reader(s) | Failure | File / location | Reproduce |" in report
     assert "a.parquet · whole file" in report
-    child_report = (child / "REPORT.md").read_text()
+    child_report = (child / "REPORT.md").read_text(encoding="utf-8")
     root_findings = report.split("## Failures", 1)[1].split("## Run details", 1)[0]
     child_findings = child_report.split("## Failures", 1)[1].split("## Outcomes", 1)[0]
     outcomes = child_report.split("## Outcomes", 1)[1].split("## Reproduce", 1)[0]
@@ -237,7 +237,9 @@ def _assert_scan_rejects_noncanonical_manifests(
     main_module = import_module("parquity.cli.main")
     for directory, manifest_name in ((standalone, "finding.json"), (aggregate, "scan.json")):
         manifest = directory / manifest_name
-        manifest.write_text(json.dumps(json.loads(manifest.read_bytes()), indent=2))
+        manifest.write_text(
+            json.dumps(json.loads(manifest.read_bytes()), indent=2), encoding="utf-8"
+        )
 
     def unexpected_resolution(readers: object) -> object:
         raise AssertionError(readers)
@@ -266,11 +268,11 @@ def test_scan_configuration_failures_publish_nothing(
     occupied = tmp_path / "occupied"
     occupied.mkdir()
     sentinel = occupied / "sentinel"
-    sentinel.write_text("preserved")
+    sentinel.write_text("preserved", encoding="utf-8")
     assert cli.main(["scan", str(source), "--out", str(occupied)]) == 2
     occupied_payload, _ = _payload(capsys)
     assert cast(dict[str, object], occupied_payload["error"])["kind"] == "OUTPUT_EXISTS"
-    assert sentinel.read_text() == "preserved"
+    assert sentinel.read_text(encoding="utf-8") == "preserved"
 
     unavailable = tmp_path / "unavailable"
     arguments = ["scan", str(source), "--engines", "unknown", "--out", str(unavailable)]

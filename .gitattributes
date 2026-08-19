@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The v0.1.0 fixtures are sealed evidence: the tests assert their exact bytes and digests, so line
+# ending conversion on checkout would corrupt them on any platform that normalizes to CRLF.
+tests/fixtures/v0_1_0/** -text

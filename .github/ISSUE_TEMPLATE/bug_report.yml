@@ -1,0 +1,43 @@
+name: Bug report
+description: Report incorrect behaviour in Parquity itself
+labels: ["bug"]
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: >
+        What Parquity did, and what you expected instead. If a run reported a
+        finding you believe is wrong, say which finding and why.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Command
+      description: The exact command line, including flags.
+      render: shell
+      placeholder: parquity scan ./files --out ./run
+
+  - type: textarea
+    attributes:
+      label: Environment
+      description: >
+        Output of `parquity version` and `parquity engines --json`. Engine
+        versions decide most of Parquity's behaviour, so this is usually the
+        first thing needed.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Evidence
+      description: >
+        If the run produced an output directory, attach it if practical. Saved
+        evidence replays with `parquity replay <bundle>`, which is faster than
+        reconstructing the failure from a description. Skip this if the bug
+        stopped the run before anything was written.
+
+  - type: textarea
+    attributes:
+      label: Anything else

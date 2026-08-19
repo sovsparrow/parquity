@@ -1,0 +1,65 @@
+name: Design proposal
+description: Propose a change to a contract, a recorded format, or the shape of a subsystem
+labels: ["proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for changes that other work will have to build on: a new
+        recorded format, a change to what a command promises, a subsystem
+        boundary. Ordinary features go in a feature request instead.
+
+  - type: textarea
+    attributes:
+      label: Problem
+      description: >
+        What is wrong today, before any solution. If this is being proposed
+        because something was rewritten more than once, say so and say what kept
+        pulling it apart.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Required behaviour
+      description: >
+        The rule a reader can check the code against later, stated as behaviour
+        rather than as an implementation, and what it forbids. A proposal that
+        cannot state this is usually still a problem statement.
+      placeholder: >
+        A timeout does not return until the process and the processes it started
+        are terminated, or until the failure to terminate them is reported.
+    validations:
+      required: true
+
+  - type: checkboxes
+    attributes:
+      label: Contracts affected
+      description: >
+        Check any existing contract this proposal changes. Recorded formats and
+        replayed artifacts carry compatibility costs.
+      options:
+        - label: "Run records (`parquity.run`, `parquity.scan-run`)"
+        - label: "Findings and finding identity (`parquity.finding`, `parquity.scan-finding`, `parquity.finding-key`)"
+        - label: "CLI contract (`parquity.cli`)"
+        - label: "Worker and bridge protocols (`parquity.worker-control`, external engine bridge)"
+        - label: "Evidence bundles and replay"
+        - label: "No existing contract — internal only"
+
+  - type: textarea
+    attributes:
+      label: Alternatives considered
+      description: >
+        Including doing nothing. If an alternative was rejected, the reason is
+        worth more than the list.
+
+  - type: textarea
+    attributes:
+      label: Open questions
+      description: What this proposal deliberately does not decide.

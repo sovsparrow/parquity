@@ -4,11 +4,16 @@ import errno
 import hashlib
 import os
 import stat
+import sys
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple
 
 from . import windows
 from .limits import MAX_FILE_BYTES, MAX_FILES, MAX_SOURCE_BYTES, MAX_VISITED_ENTRIES
+
+#: ERROR_INVALID_FUNCTION and ERROR_NOT_SUPPORTED, which is how a Windows volume says it
+#: cannot do what was asked rather than that the request was wrong.
+_WINDOWS_NO_FOLLOW_UNSUPPORTED = frozenset({1, 50})
 
 
 class ScanConfigurationError(ValueError):
@@ -205,12 +210,19 @@ def _digest(stream: BinaryIO, target: Path) -> tuple[str, int]:
 
 
 def _open_source(path: Path) -> int:
-    if windows.IS_WINDOWS:
+    if sys.platform == "win32":
         # FILE_FLAG_OPEN_REPARSE_POINT is the same guarantee O_NOFOLLOW gives: the reparse point
         # is opened rather than followed, so the regular-file check below rejects it.
         try:
             return windows.open_without_following(path)
         except OSError as error:
+            # A volume that cannot open a reparse point without following it is a platform
+            # limitation, the same one the POSIX branch reports below. Worth separating from
+            # drift, because drift is a claim that the user's file changed underneath the scan.
+            if error.winerror in _WINDOWS_NO_FOLLOW_UNSUPPORTED:
+                raise ScanConfigurationError(
+                    "SCAN_UNAVAILABLE", "scan input admission requires no-follow file access"
+                ) from error
             raise _drift() from error
     try:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC

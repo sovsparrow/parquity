@@ -247,6 +247,24 @@ def test_snapshot_refuses_source_drift(monkeypatch: pytest.MonkeyPatch, tmp_path
     source.unlink()
     source.write_bytes(b"original")
     unavailable = discover_input(source).files[0]
+
+    # A platform that cannot open a file without following a link into it is reported as
+    # unavailable rather than as drift, because drift claims the user's file changed. Each
+    # platform says so its own way: POSIX through a missing O_NOFOLLOW or an errno the flag is
+    # not supported under, Windows through ERROR_NOT_SUPPORTED out of CreateFileW.
+    if windows.IS_WINDOWS:
+
+        def unsupported_without_following(path: Path) -> int:
+            del path
+            raise OSError(discovery_module.errno.EINVAL, "unsupported", None, 50)
+
+        monkeypatch.setattr(
+            discovery_module.windows, "open_without_following", unsupported_without_following
+        )
+        unsupported_kind = _failure(snapshot_file, unavailable, tmp_path / "unsupported").kind
+        assert unsupported_kind == "SCAN_UNAVAILABLE"
+        return
+
     with monkeypatch.context() as patch:
         patch.delattr(discovery_module.os, "O_NOFOLLOW")
         assert _failure(snapshot_file, unavailable, tmp_path / "missing-primitive").kind == (

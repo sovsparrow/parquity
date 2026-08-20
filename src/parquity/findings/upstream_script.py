@@ -1,24 +1,33 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Set
 from decimal import Decimal
 from typing import cast
 
 from ..case.arrow import type_to_arrow
 from ..engines.fastparquet import pandas_dtype_plan
 from ..model import Case, Field, Kind, TypeSpec
+from ..profiles import WriterProfileIdentity
 from ..verdicts import CellResult
 
 
-def render_upstream_repro(case: Case, result: CellResult) -> bytes:
-    imports = _provider_imports(result.writer, result.reader)
-    writer = _indent([*_writer_lines(result, case), "byte_count = path.stat().st_size"], 12)
+def render_upstream_repro(
+    case: Case, result: CellResult, external: Set[str] = frozenset()
+) -> bytes:
+    selected = external & ({result.writer, result.reader})
+    imports = _provider_imports(result.writer, result.reader, selected)
+    writer = _indent(
+        [*_writer_lines(result, case, selected), "byte_count = path.stat().st_size"], 12
+    )
     temporal = contains(case, Kind.DATE32) or contains(case, Kind.TIMESTAMP)
     providers = [("writer", result.writer)]
     if result.reader != "*":
         providers.append(("reader", result.reader))
     lines = [
         "import json",
+        *(["import os"] if selected else []),
+        *(["import subprocess"] if selected else []),
         "import tempfile",
         *(["from decimal import Decimal"] if contains(case, Kind.DECIMAL128) else []),
         "from importlib import metadata",
@@ -31,10 +40,8 @@ def render_upstream_repro(case: Case, result: CellResult) -> bytes:
         f"EXPECTED_CASE = {case.to_data()!r}",
         f"TARGET = {result.to_data()!r}",
         f"PROVIDERS = {providers!r}",
-        (
-            'VERSIONS = [{"role": role, "engine": engine, '
-            '"version": metadata.version(engine)} for role, engine in PROVIDERS]'
-        ),
+        *_bridge_helper(selected),
+        *_version_lines(selected),
         f"SCHEMA = pa.schema([{', '.join(field_expression(field) for field in case.fields)}])",
         f"ROWS = {rows_source(case)}",
         *table_lines(case),
@@ -65,7 +72,7 @@ def render_upstream_repro(case: Case, result: CellResult) -> bytes:
         '        record("write", "WRITE_COMPLETED", byte_count=byte_count)',
         '        if TARGET["operation"] == "write":',
         "            return 0",
-        *_read_block(result, temporal),
+        *_read_block(result, temporal, selected),
         "",
         'if __name__ == "__main__":',
         "    raise SystemExit(main())",
@@ -73,10 +80,52 @@ def render_upstream_repro(case: Case, result: CellResult) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
-def _read_block(result: CellResult, temporal: bool) -> list[str]:
+def _bridge_helper(external: Set[str]) -> list[str]:
+    if not external:
+        return []
+    return [
+        f"BRIDGES = {sorted(external)!r}",
+        "",
+        "def bridge(engine, operation, arguments):",
+        "    variable = 'PARQUITY_ENGINE_' + engine.upper().replace('-', '_') + '_COMMAND'",
+        "    value = os.environ.get(variable)",
+        "    if not value:",
+        "        raise SystemExit(variable + ' must name the ' + engine + ' bridge command')",
+        "    command = json.loads(value) if value.strip().startswith('[') else [value]",
+        "    completed = subprocess.run(",
+        "        [*command, operation, *arguments], capture_output=True, check=False",
+        "    )",
+        "    payload = json.loads(completed.stdout or b'{}')",
+        "    if completed.returncode != 0:",
+        "        raise RuntimeError(",
+        "            payload.get('detail') or completed.stderr.decode('utf-8', 'replace')",
+        "        )",
+        "    return payload",
+    ]
+
+
+def _version_lines(external: Set[str]) -> list[str]:
+    if not external:
+        return [
+            'VERSIONS = [{"role": role, "engine": engine, '
+            '"version": metadata.version(engine)} for role, engine in PROVIDERS]'
+        ]
+    return [
+        "",
+        "def engine_version(engine):",
+        "    if engine in BRIDGES:",
+        "        return bridge(engine, 'info', [])['version']",
+        "    return metadata.version(engine)",
+        "",
+        'VERSIONS = [{"role": role, "engine": engine, '
+        '"version": engine_version(engine)} for role, engine in PROVIDERS]',
+    ]
+
+
+def _read_block(result: CellResult, temporal: bool, external: Set[str]) -> list[str]:
     if result.operation == "write":
         return []
-    reader = _indent(_reader_lines(result.reader), 12)
+    reader = _indent(_reader_lines(result.reader, external), 12)
     provider_read = [
         "        try:",
         *reader,
@@ -108,7 +157,7 @@ def _read_block(result: CellResult, temporal: bool) -> list[str]:
     ]
 
 
-def _provider_imports(writer: str, reader: str) -> list[str]:
+def _provider_imports(writer: str, reader: str, external: Set[str]) -> list[str]:
     imports = (
         ("pyarrow", "import pyarrow.parquet as pq"),
         ("duckdb", "import duckdb"),
@@ -116,16 +165,18 @@ def _provider_imports(writer: str, reader: str) -> list[str]:
         ("datafusion", "from datafusion import SessionContext"),
         ("fastparquet", "import fastparquet"),
     )
-    selected = {writer, reader}
+    selected = {writer, reader} - set(external)
     selected_imports = [source for engine, source in imports if engine in selected]
     if writer == "fastparquet":
         selected_imports.append("import pandas as pd")
     return selected_imports
 
 
-def _writer_lines(result: CellResult, case: Case) -> list[str]:
+def _writer_lines(result: CellResult, case: Case, external: Set[str]) -> list[str]:
     writer = result.writer
     profile = result.writer_profile
+    if writer in external:
+        return _bridge_write_lines(writer, profile)
     prefix = [] if profile is None else [f"options = {profile.effective_options!r}"]
     options = "" if profile is None else ", **options"
     if writer == "pyarrow":
@@ -150,7 +201,36 @@ def _writer_lines(result: CellResult, case: Case) -> list[str]:
     raise ValueError(f"unsupported writer: {writer}")
 
 
-def _reader_lines(reader: str) -> list[str]:
+def _bridge_write_lines(writer: str, profile: WriterProfileIdentity | None) -> list[str]:
+    arguments = '["--arrow", str(source), "--parquet", str(path)]'
+    if profile is not None:
+        arguments += f' + ["--profile", {profile.name!r}]'
+    return [
+        *(
+            []
+            if profile is None
+            else [f"# recorded effective options: {profile.effective_options!r}"]
+        ),
+        'source = path.with_suffix(".arrow")',
+        'with pa.OSFile(str(source), "wb") as sink:',
+        "    with pa.ipc.new_file(sink, TABLE.schema) as ipc:",
+        "        ipc.write_table(TABLE)",
+        f"bridge({writer!r}, 'write', {arguments})",
+    ]
+
+
+def _bridge_read_lines(reader: str) -> list[str]:
+    return [
+        'observed = path.with_name("observed.arrow")',
+        f'bridge({reader!r}, \'read\', ["--parquet", str(path), "--arrow", str(observed)])',
+        'with pa.OSFile(str(observed), "rb") as handle:',
+        "    actual = pa.ipc.open_file(handle).read_all()",
+    ]
+
+
+def _reader_lines(reader: str, external: Set[str]) -> list[str]:
+    if reader in external:
+        return _bridge_read_lines(reader)
     if reader == "pyarrow":
         return ["actual = pq.read_table(path)"]
     if reader == "duckdb":

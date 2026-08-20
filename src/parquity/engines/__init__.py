@@ -6,6 +6,14 @@ from importlib import import_module, metadata
 from typing import Literal, NamedTuple, Protocol, cast
 
 from .base import EngineDescriptor, EngineIdentity, EngineReader, EngineWriter
+from .external import (
+    EXTERNAL_TIER,
+    ExternalEngineConfigurationError,
+    ExternalEngineProtocolError,
+    ExternalEngineTimeout,
+    ExternalRegistration,
+    external_registrations,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +93,23 @@ EXTENDED_ENGINE_DESCRIPTORS = (
 
 ENGINE_DESCRIPTORS = CORE_ENGINE_DESCRIPTORS + EXTENDED_ENGINE_DESCRIPTORS
 PYTHON_SUPPORT = {item.name: ["3.11", "3.12", "3.13", "3.14"] for item in ENGINE_DESCRIPTORS}
+BUILTIN_ENGINE_NAMES = frozenset(item.name for item in ENGINE_DESCRIPTORS)
+
+
+def registered_descriptors() -> tuple[EngineDescriptor, ...]:
+    return ENGINE_DESCRIPTORS + tuple(item.descriptor for item in _external())
+
+
+def _external() -> tuple[ExternalRegistration, ...]:
+    return external_registrations(BUILTIN_ENGINE_NAMES)
+
+
+def external_engine_names() -> frozenset[str]:
+    return frozenset(item.spec.name for item in _external())
+
+
+def _selected(descriptors: Sequence[EngineDescriptor] | None) -> Sequence[EngineDescriptor]:
+    return registered_descriptors() if descriptors is None else descriptors
 
 
 class EngineFactory(Protocol):
@@ -137,18 +162,19 @@ class ReaderSelection(NamedTuple):
 
 
 def discover_engines(
-    descriptors: Sequence[EngineDescriptor] = ENGINE_DESCRIPTORS,
+    descriptors: Sequence[EngineDescriptor] | None = None,
 ) -> tuple[EngineAvailability, ...]:
-    return tuple(_distribution_availability(descriptor) for descriptor in descriptors)
+    return tuple(_availability(descriptor) for descriptor in _selected(descriptors))
 
 
 def resolve_engine(
     name: str,
-    descriptors: Sequence[EngineDescriptor] = ENGINE_DESCRIPTORS,
+    descriptors: Sequence[EngineDescriptor] | None = None,
 ) -> EngineResolution:
-    descriptor = next((candidate for candidate in descriptors if candidate.name == name), None)
+    selected = _selected(descriptors)
+    descriptor = next((candidate for candidate in selected if candidate.name == name), None)
     if descriptor is None:
-        choices = ", ".join(candidate.name for candidate in descriptors)
+        choices = ", ".join(candidate.name for candidate in selected)
         availability = EngineAvailability(
             name=name,
             distribution=name,
@@ -161,6 +187,8 @@ def resolve_engine(
             detail="engine is not registered",
         )
         return EngineResolution(availability, None, None)
+    if descriptor.tier == EXTERNAL_TIER:
+        return _resolve_external(descriptor.name)
     availability = _distribution_availability(descriptor)
     if not availability.available or availability.version is None:
         return EngineResolution(availability, None, None)
@@ -193,22 +221,24 @@ def resolve_engine(
 
 def resolve_engines(
     names: Sequence[str],
-    descriptors: Sequence[EngineDescriptor] = ENGINE_DESCRIPTORS,
+    descriptors: Sequence[EngineDescriptor] | None = None,
 ) -> tuple[EngineResolution, ...]:
-    return tuple(resolve_engine(name, descriptors) for name in names)
+    selected = _selected(descriptors)
+    return tuple(resolve_engine(name, selected) for name in names)
 
 
 def resolve_engine_selection(
     writer_names: str | Sequence[str] | None,
     reader_names: str | Sequence[str] | None,
-    descriptors: Sequence[EngineDescriptor] = ENGINE_DESCRIPTORS,
+    descriptors: Sequence[EngineDescriptor] | None = None,
 ) -> EngineSelection:
-    writers = _canonical_names(writer_names, "writer", descriptors)
-    readers = _canonical_names(reader_names, "reader", descriptors)
+    selected = _selected(descriptors)
+    writers = _canonical_names(writer_names, "writer", selected)
+    readers = _canonical_names(reader_names, "reader", selected)
     requested = tuple(
-        descriptor.name for descriptor in descriptors if descriptor.name in {*writers, *readers}
+        descriptor.name for descriptor in selected if descriptor.name in {*writers, *readers}
     )
-    resolutions = {name: resolve_engine(name, descriptors) for name in requested}
+    resolutions = {name: resolve_engine(name, selected) for name in requested}
     _require_available(tuple(resolutions.values()))
     resolved_writers: list[EngineWriter] = []
     resolved_readers: list[EngineReader] = []
@@ -227,10 +257,26 @@ def resolve_engine_selection(
 
 def resolve_reader_selection(
     reader_names: str | Sequence[str] | None,
-    descriptors: Sequence[EngineDescriptor] = ENGINE_DESCRIPTORS,
+    descriptors: Sequence[EngineDescriptor] | None = None,
 ) -> ReaderSelection:
-    names = _canonical_names(reader_names, "reader", descriptors)
-    resolutions = resolve_engines(names, descriptors)
+    """Resolves the readers for `scan`, which external engines may not join.
+
+    Reader-only selection is what `scan` and replay of scan evidence use, and scan reads its files
+    inside a worker with its own contract: a bridge that stops answering is classified there by
+    rules written for an in-process provider, and `ReaderOutcomeKind.TIMEOUT` has nothing mapped to
+    it. Rather than let that be discovered from a confusing run, an external engine is refused
+    here until the scan worker knows what to do with one.
+    """
+    selected = _selected(descriptors)
+    names = _canonical_names(reader_names, "reader", selected)
+    by_name = {descriptor.name: descriptor for descriptor in selected}
+    external = [name for name in names if by_name[name].tier == EXTERNAL_TIER]
+    if external:
+        raise EngineSelectionError(
+            "ENGINE_CAPABILITY_ERROR",
+            f"external engines are not available to scan: {', '.join(external)}",
+        )
+    resolutions = resolve_engines(names, selected)
     _require_available(resolutions)
     readers: list[EngineReader] = []
     for resolution in resolutions:
@@ -295,6 +341,51 @@ def _canonical_names(
     return tuple(descriptor.name for descriptor in descriptors if descriptor.name in selected)
 
 
+def _availability(descriptor: EngineDescriptor) -> EngineAvailability:
+    if descriptor.tier != EXTERNAL_TIER:
+        return _distribution_availability(descriptor)
+    registration = next((item for item in _external() if item.spec.name == descriptor.name), None)
+    if registration is None:
+        raise EngineSelectionError(
+            "ENGINE_UNAVAILABLE", f"external engine is no longer configured: {descriptor.name}"
+        )
+    return _external_availability(registration)
+
+
+def _external_availability(registration: ExternalRegistration) -> EngineAvailability:
+    descriptor = registration.descriptor
+    info = registration.info
+    return EngineAvailability(
+        name=descriptor.name,
+        distribution=descriptor.distribution,
+        tier=EXTERNAL_TIER,
+        reader=descriptor.reader,
+        writer=descriptor.writer,
+        available=info is not None,
+        version=None if info is None else info.version,
+        installation_hint=None if info is not None else descriptor.installation_hint,
+        detail=registration.detail,
+    )
+
+
+def _resolve_external(name: str) -> EngineResolution:
+    from .external.adapter import create_engine  # noqa: PLC0415 - defers the pyarrow import.
+
+    registration = next((item for item in _external() if item.spec.name == name), None)
+    if registration is None:
+        raise EngineSelectionError(
+            "ENGINE_UNAVAILABLE", f"external engine is no longer configured: {name}"
+        )
+    availability = _external_availability(registration)
+    info = registration.info
+    if info is None:
+        return EngineResolution(availability, None, None)
+    engine = create_engine(registration.spec, info)
+    return EngineResolution(
+        availability, engine if info.reader else None, engine if info.writer else None
+    )
+
+
 def _distribution_availability(descriptor: EngineDescriptor) -> EngineAvailability:
     try:
         version = metadata.version(descriptor.distribution)
@@ -321,6 +412,38 @@ def _distribution_availability(descriptor: EngineDescriptor) -> EngineAvailabili
         installation_hint=None,
         detail="distribution metadata found",
     )
+
+
+__all__ = [
+    "BUILTIN_ENGINE_NAMES",
+    "CORE_ENGINE_DESCRIPTORS",
+    "ENGINE_DESCRIPTORS",
+    "EXTENDED_ENGINE_DESCRIPTORS",
+    "EXTERNAL_TIER",
+    "PYTHON_SUPPORT",
+    "EngineAvailability",
+    "EngineDescriptor",
+    "EngineFactory",
+    "EngineIdentity",
+    "EngineReader",
+    "EngineResolution",
+    "EngineSelection",
+    "EngineSelectionError",
+    "EngineWriter",
+    "ExternalEngineConfigurationError",
+    "ExternalEngineProtocolError",
+    "ExternalEngineTimeout",
+    "ExternalRegistration",
+    "ReaderSelection",
+    "default_engine_names",
+    "discover_engines",
+    "external_engine_names",
+    "registered_descriptors",
+    "resolve_engine",
+    "resolve_engine_selection",
+    "resolve_engines",
+    "resolve_reader_selection",
+]
 
 
 def _validate_engine(

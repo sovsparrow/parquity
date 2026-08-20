@@ -24,8 +24,8 @@ class EngineDescriptor:
     writer: bool
 
     def __post_init__(self) -> None:
-        if self.tier not in ("core", "extended"):
-            raise ValueError("engine tier must be core or extended")
+        if self.tier not in ("core", "extended", "external"):
+            raise ValueError("engine tier must be core, extended, or external")
         if not self.reader and not self.writer:
             raise ValueError("an engine must declare at least one direction")
 
@@ -34,10 +34,18 @@ EngineIdentity: TypeAlias = EngineVersion
 
 
 class ProviderOperationError(Exception):
-    def __init__(self, engine: str, operation: str, cause: Exception) -> None:
+    def __init__(
+        self,
+        engine: str,
+        operation: str,
+        cause: Exception,
+        provider_type: str | None = None,
+    ) -> None:
         self.engine = engine
         self.operation = operation
-        self.provider_type = type(cause).__name__
+        # An out-of-process provider reports its own error class, which the local
+        # exception type cannot carry. Everything else names the raised exception.
+        self.provider_type = type(cause).__name__ if provider_type is None else provider_type
         self.detail = bounded_detail(cause)
         super().__init__(f"{engine} {operation} failed: {self.provider_type}: {self.detail}")
 

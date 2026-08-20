@@ -4,6 +4,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..engines import external_engine_names
 from ..evidence import EngineVersion, EnvironmentEvidence, sha256_hex
 from ..evidence import json_codec as codec
 from ..evidence.storage import (
@@ -212,7 +213,7 @@ def _artifact_payloads(
         "case.json": source.case.canonical_bytes(),
         "matrix.json": matrix.canonical_bytes(),
         "reproduce.py": render_reproduce(),
-        "upstream_repro.py": render_upstream_repro(source.case, selected),
+        "upstream_repro.py": render_upstream_repro(source.case, selected, external_engine_names()),
     }
     if source.discovered_case.case_id != source.case.case_id:
         payloads[OPTIONAL_DISCOVERED_CASE] = source.discovered_case.canonical_bytes()

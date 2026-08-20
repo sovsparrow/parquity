@@ -94,12 +94,27 @@ class ExternalEngine:
             raise ExternalEngineProtocolError(
                 diagnostic(f"bridge rejected the {operation} request{reported}", outcome.stderr)
             )
-        if outcome.exit_code == 1 and failure is not None:
+        if outcome.exit_code == 1:
+            if failure is None:
+                # Exit 1 is the bridge saying its implementation tried and failed, and the response
+                # is the only thing that says what failed. Without a well-formed one there is
+                # nothing to record but a guess, and the guess would be a finding against an engine
+                # that may not have failed at all. So this joins exit 2 on the run-stopping side.
+                #
+                # A crash below is different, and stays evidence: there Parquity observes the
+                # process exit itself, outside the protocol, rather than being told about a failure
+                # it cannot read.
+                raise ExternalEngineProtocolError(
+                    diagnostic(
+                        f"bridge reported a {operation} failure without a well-formed response",
+                        outcome.stderr,
+                    )
+                )
             raise self._failure(operation, failure.kind, failure.detail, outcome.stderr)
         raise self._failure(
             operation,
             CRASH_KIND,
-            f"bridge exited {outcome.exit_code} without a well-formed response",
+            f"bridge exited {outcome.exit_code}",
             outcome.stderr,
         )
 

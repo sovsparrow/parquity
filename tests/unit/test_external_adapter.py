@@ -111,19 +111,34 @@ def test_a_broken_contract_stops_the_run(
         writer.write(TABLE, tmp_path / "artifact.parquet")
 
 
-@pytest.mark.parametrize("injected", ("crash", "malformed-failure"))
 def test_a_crash_is_evidence_because_the_implementation_still_failed(
-    injected: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # An exit without a usable response is the implementation dying on this input, which is a real
-    # observation -- unlike a rejected request, which is Parquity's mistake.
+    # A process that dies on this input is a real observation, which Parquity makes itself by
+    # watching the exit -- unlike a rejected request, which is Parquity's mistake.
     writer = _writer(tmp_path, monkeypatch)
-    bridge.fault(monkeypatch, injected)
+    bridge.fault(monkeypatch, "crash")
 
     with pytest.raises(ProviderOperationError) as caught:
         writer.write(TABLE, tmp_path / "artifact.parquet")
 
     assert caught.value.provider_type == CRASH_KIND
+
+
+def test_a_failure_exit_without_a_readable_response_stops_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exit 1 claims the implementation failed, and the response is the only thing that says what
+    # failed. Unreadable, it names no cause, so filing it as evidence would blame an engine that
+    # may be fine -- the same reason exit 2 stops the run. A crash is not the same: there the
+    # process exit is observed outside the protocol.
+    writer = _writer(tmp_path, monkeypatch)
+    bridge.fault(monkeypatch, "malformed-failure")
+
+    with pytest.raises(ExternalEngineProtocolError) as caught:
+        writer.write(TABLE, tmp_path / "artifact.parquet")
+
+    assert "without a well-formed response" in str(caught.value)
 
 
 def test_an_operation_that_exceeds_its_timeout_is_not_a_provider_failure(

@@ -128,9 +128,9 @@ failure. Neither stream may exceed 64 KiB. Stdin is closed.
 | Exit | Stdout | Meaning | How Parquity records it |
 |---:|---|---|---|
 | 0 | `{"status":"OK"}` | The operation succeeded and produced its output file. | Normal result. |
-| 1 | `{"status":"ERROR","kind":"...","detail":"..."}` | The implementation tried and failed. | Provider failure — evidence, with `kind` as the diagnostic kind. |
+| 1 | `{"status":"ERROR","kind":"...","detail":"..."}` | The implementation tried and failed. | Provider failure — evidence, with `kind` as the diagnostic kind. A response that cannot be read is a protocol error instead, and the run stops. |
 | 2 | `{"status":"ERROR","kind":"...","detail":"..."}` | The bridge rejected Parquity's request: unknown operation, missing argument, undeclared profile. | Protocol error — the run stops. |
-| other | any | The process crashed, was killed, or exited without a well-formed response. | Provider failure — evidence, as `ExternalEngineCrash`. |
+| other | any | The process crashed or was killed. | Provider failure — evidence, as `ExternalEngineCrash`. |
 
 A bridge that does not answer within its timeout is neither: nothing was observed about
 the implementation, so the run stops rather than recording a finding against it.
@@ -156,7 +156,12 @@ against an engine that did nothing wrong. The run stops with
 `EXTERNAL_ENGINE_TIMEOUT`, reported against the `timeout_seconds` that fixes it.
 
 A crash is treated as evidence, unlike a timeout: a process that dies on a
-particular input has told you something about the implementation.
+particular input has told you something about the implementation. That is also
+what separates a crash from exit 1 with an unreadable response. For a crash
+Parquity observes the process exit itself, outside the protocol; exit 1 is the
+bridge saying its implementation failed, and if the response cannot be read then
+nothing says what failed, so recording it would name a cause Parquity does not
+have.
 
 ## Evidence and replay
 

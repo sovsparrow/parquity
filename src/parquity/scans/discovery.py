@@ -159,7 +159,7 @@ def _classify_entry(
 
 def _entry_status(entry: os.DirEntry[str]) -> os.stat_result:
     status = entry.stat(follow_symlinks=False)
-    if windows.IS_WINDOWS and not status.st_ino:
+    if sys.platform == "win32" and not status.st_ino:
         # A Windows directory entry carries no file index, so its device and inode read as zero.
         # The snapshot compares this identity against one taken from the open handle, which does
         # carry them, so a directory scan would report drift on every file. Take a real stat, which
@@ -255,7 +255,13 @@ def _identity(status: os.stat_result) -> FileIdentity:
         # guards against -- a file substituted between discovery and copy -- is already covered
         # there: st_dev is the volume serial and st_ino the file ID, which together identify the
         # file itself rather than the name it was reached by.
-        0 if windows.IS_WINDOWS else status.st_ctime_ns,
+        #
+        # `sys.platform`, not `windows.IS_WINDOWS`, and the same a few lines up. Which platform
+        # this is cannot change while the process runs, and reading it through a module attribute
+        # invites a test that means to disable the *worker's* containment to silently disable this
+        # too -- which is how one did, passing here and failing on a runner whose volume reports
+        # the discrepancy this line exists for.
+        0 if sys.platform == "win32" else status.st_ctime_ns,
     )
 
 

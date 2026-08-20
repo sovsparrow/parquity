@@ -22,7 +22,7 @@ body:
     attributes:
       label: Environment
       description: >
-        Output of `parquity version` and `parquity engines --json`. Engine
+        Output of `parquity --version` and `parquity engines --json`. Engine
         versions decide most of Parquity's behaviour, so this is usually the
         first thing needed.
       render: shell

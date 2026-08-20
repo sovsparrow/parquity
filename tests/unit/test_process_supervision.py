@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import time
@@ -384,4 +385,23 @@ def test_a_refused_assignment_stops_rather_than_supervising_an_uncontained_worke
         _run("success", tmp_path)
     assert "containment" in str(refused.value)
     assert not resumed, "a worker that was never contained must not be started"
+    assert not (tmp_path / "worker").exists()
+
+
+@pytest.mark.skipif(not windows.IS_WINDOWS, reason="job containment is the Windows path")
+def test_a_failure_to_resume_is_reported_like_any_other_startup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # resume_process raises WinError when the thread snapshot cannot be taken. Left bare, that is
+    # the one startup failure that reaches the caller as an OSError while every other arrives as
+    # WorkerInternalError.
+    def refuse(pid: int) -> int:
+        del pid
+        raise OSError(errno.EACCES, "controlled snapshot failure", None, 5)
+
+    monkeypatch.setattr(process_module.windows, "resume_process", refuse)
+    with pytest.raises(WorkerInternalError) as failure:
+        _run("success", tmp_path)
+    assert "resumed" in str(failure.value)
+    assert isinstance(failure.value.__cause__, OSError)
     assert not (tmp_path / "worker").exists()

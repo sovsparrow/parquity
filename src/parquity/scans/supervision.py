@@ -322,6 +322,12 @@ def _contain(process: subprocess.Popen[bytes], job: windows.ProcessJob) -> _Supe
             # while it was being assigned -- the very window creating it suspended exists to
             # close. Refusing here keeps that guarantee checked rather than assumed.
             raise WorkerInternalError("worker was not suspended while it was being contained")
+    except OSError as error:
+        # `resume_process` raises WinError if the thread snapshot cannot be taken, and a bare
+        # OSError here would be the one startup failure reported differently from every other.
+        _discard(process)
+        job.close()
+        raise WorkerInternalError("worker could not be resumed once contained") from error
     except BaseException:
         _discard(process)
         job.close()

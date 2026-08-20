@@ -180,6 +180,26 @@ same way it is reported for a Python provider. Replaying evidence that names an
 external engine requires that engine to be configured; it is a configuration
 error otherwise, not a smaller matrix.
 
+## What running a bridge does and does not do for you
+
+Parquity runs a bridge as an ordinary subprocess. Two limits follow from that,
+and neither is hidden by anything above.
+
+**A timeout terminates the bridge, not everything the bridge started.** If a
+bridge spawns its own helper processes — a JVM, a worker pool, a container —
+those are not tracked, and a bridge killed at its deadline may leave them
+running. Reap what you start, or make sure a bridge's children die with it.
+
+**Output is bounded after it is read, not while it is being read.** Parquity
+reads a bridge's stdout and stderr to completion and then enforces the 64 KiB
+limit, so a bridge that writes far more than that has already been held in
+memory by the time the limit is applied. The limit protects the evidence, not
+the machine. Keep diagnostics small.
+
+Both are properties of how the bridge is run rather than of the contract, and
+both are tracked upstream in
+[#12](https://github.com/sovsparrow/parquity/issues/12).
+
 ## Scope
 
 External engines participate in `check`, `fuzz`, and `engines`. They are

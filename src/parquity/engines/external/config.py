@@ -17,6 +17,12 @@ MAX_NAME_LENGTH = 32
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 _ENGINE_KEYS = frozenset({"command", "timeout_seconds"})
 
+# The declarations a run was configured with, read once. A run records evidence against the
+# engines it was given, so re-reading the file mid-run would let that set change underneath it --
+# and it would be read again for every enumeration, which is several times in a single command.
+# Keyed by path, so pointing the variable somewhere else still takes effect.
+_DECLARATIONS: dict[Path, Mapping[str, Mapping[str, object]]] = {}
+
 
 class ExternalEngineConfigurationError(ValueError):
     pass
@@ -60,7 +66,15 @@ def configured_specs(reserved: Set[str]) -> tuple[ExternalEngineSpec, ...]:
     )
 
 
+def reset_declaration_cache() -> None:
+    """Forgets the engines file, so a caller that rewrites it is read again."""
+    _DECLARATIONS.clear()
+
+
 def _declarations(path: Path) -> Mapping[str, Mapping[str, object]]:
+    cached = _DECLARATIONS.get(path)
+    if cached is not None:
+        return cached
     try:
         payload = path.read_bytes()
     except OSError as error:
@@ -82,7 +96,11 @@ def _declarations(path: Path) -> Mapping[str, Mapping[str, object]]:
     engines = _mapping(document.get("engines", {}))
     if engines is None:
         raise ExternalEngineConfigurationError(f"engines must be a table of engines: {path}")
-    return {name: _table(name, engines[name]) for name in engines}
+    # Only a file that parsed is remembered, so a malformed one is reported every time it is
+    # asked for rather than once.
+    declarations = {name: _table(name, engines[name]) for name in engines}
+    _DECLARATIONS[path] = declarations
+    return declarations
 
 
 def _mapping(value: object) -> Mapping[str, object] | None:
@@ -176,4 +194,5 @@ __all__ = [
     "ExternalEngineSpec",
     "configured_specs",
     "name_is_valid",
+    "reset_declaration_cache",
 ]

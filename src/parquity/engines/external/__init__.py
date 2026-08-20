@@ -10,6 +10,7 @@ from .config import (
     ExternalEngineConfigurationError,
     ExternalEngineSpec,
     configured_specs,
+    reset_declaration_cache,
 )
 from .process import BridgeUnavailableError, diagnostic, run_bridge
 from .protocol import (
@@ -58,8 +59,14 @@ def external_registration(name: str, reserved: Set[str]) -> ExternalRegistration
     return next((item for item in external_registrations(reserved) if item.spec.name == name), None)
 
 
-def reset_probe_cache() -> None:
+def reset_external_engine_caches() -> None:
+    """Forgets both the engines file and the probes taken through it.
+
+    A run reads its configuration once and probes each bridge once, so anything that rewrites the
+    file after a read has to say so. That is a test, in practice.
+    """
     _PROBE_CACHE.clear()
+    reset_declaration_cache()
 
 
 def _registration(spec: ExternalEngineSpec) -> ExternalRegistration:
@@ -102,5 +109,5 @@ __all__ = [
     "ExternalRegistration",
     "external_registration",
     "external_registrations",
-    "reset_probe_cache",
+    "reset_external_engine_caches",
 ]

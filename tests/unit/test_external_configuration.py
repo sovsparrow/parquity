@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from parquity.engines.external import reset_external_engine_caches
 from parquity.engines.external.config import (
     DEFAULT_TIMEOUT_SECONDS,
     ENGINES_FILE_VARIABLE,
@@ -18,9 +19,15 @@ _COMMAND = '["/opt/bridge"]'
 
 
 def _declare(document: str, root: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Writes a declaration file and points Parquity at it, forgetting the previous one.
+
+    The file is read once per run, so a test that declares a second configuration has to say that
+    it is a new one rather than the same file being re-read.
+    """
     path = root / "engines.toml"
     path.write_text(document, encoding="utf-8")
     monkeypatch.setenv(ENGINES_FILE_VARIABLE, str(path))
+    reset_external_engine_caches()
     return path
 
 
@@ -122,3 +129,36 @@ def test_a_malformed_command_override_is_a_configuration_error(
     monkeypatch.setenv("PARQUITY_ENGINE_ALPHA_COMMAND", value)
     with pytest.raises(ExternalEngineConfigurationError, match="JSON array of strings"):
         configured_specs(BUILTIN)
+
+
+def test_the_engines_file_is_read_once_so_a_run_sees_one_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Evidence is recorded against the engines a run was given. Re-reading the file for every
+    # enumeration -- which is several times in one command -- would let that set change underneath
+    # the run it is describing.
+    path = _declare(f"[engines.alpha]\ncommand = {_COMMAND}\n", tmp_path, monkeypatch)
+    assert [spec.name for spec in configured_specs(BUILTIN)] == ["alpha"]
+
+    path.write_text(f"[engines.beta]\ncommand = {_COMMAND}\n", encoding="utf-8")
+    assert [spec.name for spec in configured_specs(BUILTIN)] == ["alpha"]
+
+    reset_external_engine_caches()
+    assert [spec.name for spec in configured_specs(BUILTIN)] == ["beta"]
+
+    # Pointing the variable somewhere else is a different file, not the same one changing.
+    other = tmp_path / "other.toml"
+    other.write_text(f"[engines.gamma]\ncommand = {_COMMAND}\n", encoding="utf-8")
+    monkeypatch.setenv(ENGINES_FILE_VARIABLE, str(other))
+    assert [spec.name for spec in configured_specs(BUILTIN)] == ["gamma"]
+
+
+def test_a_file_that_does_not_parse_is_reported_every_time_it_is_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only a successful read is remembered, so a broken file does not report once and then look
+    # like an empty configuration.
+    _declare("not toml [[[", tmp_path, monkeypatch)
+    for _ in range(2):
+        with pytest.raises(ExternalEngineConfigurationError, match="not valid UTF-8 TOML"):
+            configured_specs(BUILTIN)

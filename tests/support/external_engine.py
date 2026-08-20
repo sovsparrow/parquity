@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from parquity.engines.external import reset_probe_cache
+from parquity.engines.external import reset_external_engine_caches
 from parquity.engines.external.config import ENGINES_FILE_VARIABLE
 
 BRIDGE = Path(__file__).with_name("bridge_program.py")
@@ -39,7 +39,7 @@ def configure(
     *,
     engine: str = NAME,
 ) -> Path:
-    """Points Parquity at a bridge declaration and clears the memoized probe.
+    """Points Parquity at a bridge declaration and clears the memoized configuration and probe.
 
     The probe is cached per process so a run spawns each bridge once; a test that changes what the
     bridge reports has to invalidate it or it would observe the previous answer.
@@ -47,7 +47,7 @@ def configure(
     path = root / "engines.toml"
     path.write_text(declaration(engine) if document is None else document, encoding="utf-8")
     monkeypatch.setenv(ENGINES_FILE_VARIABLE, str(path))
-    reset_probe_cache()
+    reset_external_engine_caches()
     return path
 
 
@@ -56,12 +56,12 @@ def fault(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
         monkeypatch.delenv("PARQUITY_TEST_BRIDGE_FAULT", raising=False)
     else:
         monkeypatch.setenv("PARQUITY_TEST_BRIDGE_FAULT", value)
-    reset_probe_cache()
+    reset_external_engine_caches()
 
 
 def directions(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("PARQUITY_TEST_BRIDGE_DIRECTIONS", value)
-    reset_probe_cache()
+    reset_external_engine_caches()
 
 
 __all__ = [

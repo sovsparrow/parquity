@@ -7,6 +7,13 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-20
+
+### Fixed
+
+- Record a PyArrow read or write failure reported as an `OSError` as provider
+  evidence, so one unreadable file no longer ends the run.
+
 ## [0.2.1] - 2026-08-18
 
 ### Fixed
@@ -79,6 +86,8 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
   selected writer supports them.
 - Support Python 3.11 through 3.14 and ship typed package metadata.
 
-[Unreleased]: https://github.com/sovsparrow/parquity/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sovsparrow/parquity/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/sovsparrow/parquity/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/sovsparrow/parquity/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sovsparrow/parquity/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sovsparrow/parquity/releases/tag/v0.1.0

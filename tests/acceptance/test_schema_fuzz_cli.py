@@ -108,7 +108,7 @@ def _invalid_schema_probe(arguments: list[str], result_path: str) -> None:
         "stderr": stderr.getvalue(),
         "loaded": loaded,
     }
-    Path(result_path).write_text(json.dumps(result, sort_keys=True))
+    Path(result_path).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
 
 
 @pytest.mark.parametrize("shape", ("missing", "malformed", "wrong", "unsupported", "rows", "limit"))
@@ -118,13 +118,14 @@ def test_invalid_schema_exits_two_before_engines_evaluation_or_output(
 ) -> None:
     path = tmp_path / f"{shape}.json"
     if shape == "malformed":
-        path.write_text("{")
+        path.write_text("{", encoding="utf-8")
     elif shape == "wrong":
-        path.write_text('{"format":"other","schema":[],"rows":[]}')
+        path.write_text('{"format":"other","schema":[],"rows":[]}', encoding="utf-8")
     elif shape == "unsupported":
         path.write_text(
             '{"format":"parquity.case.v1","schema":[{"name":"x","nullable":false,'
-            '"type":{"kind":"decimal"}}],"rows":[]}'
+            '"type":{"kind":"decimal"}}],"rows":[]}',
+            encoding="utf-8",
         )
     elif shape == "rows":
         path.write_bytes(Case(_template().fields, ((1, [True, False]),)).canonical_bytes())
@@ -141,7 +142,7 @@ def test_invalid_schema_exits_two_before_engines_evaluation_or_output(
     process.start()
     process.join()
     assert process.exitcode == 0
-    result = cast(dict[str, object], json.loads(result_path.read_text()))
+    result = cast(dict[str, object], json.loads(result_path.read_text(encoding="utf-8")))
     payload = cast(dict[str, object], result["payload"])
     assert result["exit_code"] == 2
     error = cast(dict[str, object], payload["error"])

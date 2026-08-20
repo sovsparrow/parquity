@@ -23,6 +23,7 @@ from parquity.runs.formats import v1 as model
 from parquity.runs.report import build_run_report_view
 from parquity.verdicts import CellResult, MatrixRun, Verdict
 from tests.support import generated_run as fixtures
+from tests.support import symlinks_available
 
 _CASE, _ENGINES = fixtures.CASE, fixtures.ENGINES
 _CAPPED, _FAILURES = fixtures.CAPPED, fixtures.FAILURES
@@ -159,7 +160,9 @@ def test_run_replay_and_profile_drift(tmp_path: Path, capsys: pytest.CaptureFixt
     assert tuple(item.classification.value for item in outcome.outcomes) == tuple(
         expected[item.fingerprint] for item in validated.run.findings
     )
-    (sorted((destination / "findings").iterdir())[-1] / "REPORT.md").write_text("tampered")
+    (sorted((destination / "findings").iterdir())[-1] / "REPORT.md").write_text(
+        "tampered", encoding="utf-8"
+    )
     calls = 0
 
     def forbidden(case: Case, directory: Path) -> MatrixRun:
@@ -214,13 +217,15 @@ def test_run_replay_and_profile_drift(tmp_path: Path, capsys: pytest.CaptureFixt
     ),
 )
 def test_run_root_inventory_rejects_wrong_types(tmp_path: Path, shape: str) -> None:
+    if shape in ("link", "child-link") and not symlinks_available(tmp_path):
+        pytest.skip("creating a symlink requires a privilege this environment lacks")
     destination = tmp_path / "run"
     if shape == "file":
-        destination.write_text("not a directory")
+        destination.write_text("not a directory", encoding="utf-8")
     else:
         bundle.publish_run(_source(), destination, _evaluate)
         if shape == "extra":
-            (destination / "extra").write_text("unexpected")
+            (destination / "extra").write_text("unexpected", encoding="utf-8")
         elif shape == "link":
             target = tmp_path / "report"
             (destination / "REPORT.md").rename(target)
@@ -230,7 +235,7 @@ def test_run_root_inventory_rejects_wrong_types(tmp_path: Path, shape: str) -> N
             (destination / "run.json").mkdir()
         elif shape == "findings":
             shutil.rmtree(destination / "findings")
-            (destination / "findings").write_text("not a directory")
+            (destination / "findings").write_text("not a directory", encoding="utf-8")
         elif shape == "digest":
             path = destination / "run.json"
             data = cast(dict[str, object], json.loads(path.read_bytes()))
@@ -238,7 +243,7 @@ def test_run_root_inventory_rejects_wrong_types(tmp_path: Path, shape: str) -> N
             path.write_bytes(canonical_bytes(data))
         elif shape == "noncanonical":
             path = destination / "run.json"
-            path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2))
+            path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2), encoding="utf-8")
         elif shape == "child-extra":
             (destination / "findings" / "unexpected").mkdir()
         else:

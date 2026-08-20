@@ -15,6 +15,7 @@ from typing import BinaryIO, NamedTuple, cast
 
 from ..configuration import scan_timeout_is_valid
 from ..evidence import digest_matches
+from . import windows
 from .control import (
     ARTIFACT_NAME,
     CONTROL_NAME,
@@ -82,7 +83,7 @@ def run_worker_process(
 ) -> WorkerOutcome:
     if not scan_timeout_is_valid(timeout_seconds):
         raise ValueError("worker timeout must be in [1, 300]")
-    if os.name != "posix" or not hasattr(os, "killpg"):
+    if not windows.IS_WINDOWS and (os.name != "posix" or not hasattr(os, "killpg")):
         raise WorkerUnavailableError("worker process-group isolation is unavailable")
     try:
         private_directory.mkdir()
@@ -108,10 +109,26 @@ def _execute(
     timeout: int,
     owned_root: Path,
 ) -> WorkerOutcome:
-    process = _spawn(argv)
+    supervised = _spawn(argv)
+    try:
+        return _supervise(supervised, private_directory, engine, version, timeout, owned_root)
+    finally:
+        # Closing the job is what releases the containment, and on Windows it also kills anything
+        # still inside it, so it happens however this returns.
+        supervised.release()
+
+
+def _supervise(
+    process: _Supervised,
+    private_directory: Path,
+    engine: str,
+    version: str,
+    timeout: int,
+    owned_root: Path,
+) -> WorkerOutcome:
     stdout = _Capture(MAX_STDOUT_BYTES, bytearray())
     stderr = _Capture(MAX_STDERR_BYTES, bytearray())
-    streams = (cast(BinaryIO, process.stdout), cast(BinaryIO, process.stderr))
+    streams = (cast(BinaryIO, process.process.stdout), cast(BinaryIO, process.process.stderr))
     threads = tuple(
         threading.Thread(target=capture.drain, args=(stream,), daemon=True)
         for capture, stream in zip((stdout, stderr), streams, strict=True)
@@ -207,70 +224,167 @@ def _read_control(directory: Path, engine: str, version: str) -> WorkerControl:
     return control
 
 
-def _spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
+@dataclass(slots=True)
+class _Supervised:
+    """A worker and the boundary that contains whatever it starts.
+
+    POSIX puts the worker in its own session, so the tree is reachable through its process group.
+    Windows has no process group that survives across processes, so the worker is placed in a job
+    object instead, which terminates the tree the same way and, because it is created with
+    KILL_ON_JOB_CLOSE, still does so if this supervisor dies first.
+    """
+
+    process: subprocess.Popen[bytes]
+    job: windows.ProcessJob | None = None
+
+    def request_stop(self) -> bool:
+        """Asks the tree to exit. Windows has no polite equivalent, so it reports no attempt."""
+        if self.job is not None:
+            return False
+        try:
+            os.killpg(self.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def force_stop(self) -> bool:
+        """Kills the tree outright."""
+        if self.job is not None:
+            return self.job.terminate()
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def gone(self) -> bool:
+        """Whether nothing of the tree remains."""
+        if self.job is not None:
+            return self.job.active() == 0
+        try:
+            os.killpg(self.process.pid, 0)
+        except (PermissionError, ProcessLookupError):  # Owned PGID is no longer signalable.
+            return True
+        return False
+
+    def release(self) -> None:
+        if self.job is not None:
+            self.job.close()
+
+
+def _spawn(argv: Sequence[str]) -> _Supervised:
+    job = None
     try:
-        return subprocess.Popen(  # noqa: S603 - caller supplies a shell-free worker argv.
+        job = windows.ProcessJob() if windows.IS_WINDOWS else None
+        process = subprocess.Popen(  # noqa: S603 - caller supplies a shell-free worker argv.
             list(argv),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
-            start_new_session=True,
+            # Both are named on both platforms and each is inert on the one it does not belong to.
+            # A new session on POSIX is what makes the process group reachable; a new process group
+            # on Windows keeps a console signal aimed at this process from reaching the worker,
+            # where containment itself is the job object's job.
+            start_new_session=not windows.IS_WINDOWS,
+            creationflags=_creation_flags(),
         )
     except OSError as error:
+        if job is not None:
+            job.close()
         raise WorkerInternalError("worker process could not be started") from error
+    if job is None:
+        return _Supervised(process, None)
+    return _contain(process, job)
 
 
-def _wait_for_process(child: subprocess.Popen[bytes], timeout: int) -> tuple[int, bool, bool, bool]:
+def _creation_flags() -> int:
+    if not windows.IS_WINDOWS:
+        return 0
+    # Suspended, so that the worker exists -- and can therefore be placed in the job -- before it
+    # has run any code of its own. Assigning a running process leaves a window in which anything
+    # it starts is created outside the job, and POSIX has no equivalent window because
+    # start_new_session is applied as part of starting the process rather than after it.
+    return windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED
+
+
+def _contain(process: subprocess.Popen[bytes], job: windows.ProcessJob) -> _Supervised:
+    """Places a suspended worker in its job and starts it, or leaves nothing behind."""
+    try:
+        if not job.assign(process.pid):
+            # The worker is suspended, so it cannot have exited and cannot have started anything.
+            # A refusal here is a real failure to contain, and continuing would supervise a worker
+            # the job does not hold: a timeout would terminate an empty job and then report the
+            # tree gone while it is still running.
+            raise WorkerInternalError("worker could not be placed in its containment job")
+        if not windows.resume_process(process.pid):
+            # Zero means no thread was found suspended, so the worker had already been running
+            # while it was being assigned -- the very window creating it suspended exists to
+            # close. Refusing here keeps that guarantee checked rather than assumed.
+            raise WorkerInternalError("worker was not suspended while it was being contained")
+    except OSError as error:
+        # `resume_process` raises WinError if the thread snapshot cannot be taken, and a bare
+        # OSError here would be the one startup failure reported differently from every other.
+        _discard(process)
+        job.close()
+        raise WorkerInternalError("worker could not be resumed once contained") from error
+    except BaseException:
+        _discard(process)
+        job.close()
+        raise
+    return _Supervised(process, job)
+
+
+def _discard(process: subprocess.Popen[bytes]) -> None:
+    """Kills a worker that was never contained, and closes what was opened for it."""
+    with suppress(OSError):
+        process.kill()
+    with suppress(OSError, subprocess.TimeoutExpired):
+        process.wait(timeout=TERMINATION_GRACE_SECONDS)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            with suppress(OSError):
+                stream.close()
+
+
+def _wait_for_process(child: _Supervised, timeout: int) -> tuple[int, bool, bool, bool]:
     try:
         try:
-            return child.wait(timeout=float(timeout)), False, False, False
+            return child.process.wait(timeout=float(timeout)), False, False, False
         except subprocess.TimeoutExpired:
             pass
         return_code, terminated, killed = _shutdown_group(child, reap=True)
     except (OSError, subprocess.TimeoutExpired) as error:
         with suppress(OSError):
-            os.killpg(child.pid, signal.SIGKILL)
-        if child.returncode is None:
+            child.force_stop()
+        if child.process.returncode is None:
             with suppress(OSError, subprocess.TimeoutExpired):
-                child.wait(timeout=TERMINATION_GRACE_SECONDS)
+                child.process.wait(timeout=TERMINATION_GRACE_SECONDS)
         raise WorkerInternalError("worker process group could not be shut down") from error
     return cast(int, return_code), True, terminated, killed
 
 
-def _shutdown_group(
-    process: subprocess.Popen[bytes], *, reap: bool
-) -> tuple[int | None, bool, bool]:
+def _shutdown_group(child: _Supervised, *, reap: bool) -> tuple[int | None, bool, bool]:
     deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
-    terminated = _signal_group(process.pid, signal.SIGTERM)
+    terminated = child.request_stop()
     return_code: int | None = None
     if reap:
         with suppress(subprocess.TimeoutExpired):
-            return_code = process.wait(timeout=TERMINATION_GRACE_SECONDS)
-    if _wait_group_absent(process.pid, deadline) and (return_code is not None or not reap):
+            return_code = child.process.wait(timeout=TERMINATION_GRACE_SECONDS)
+    if _wait_group_absent(child, deadline) and (return_code is not None or not reap):
         return return_code, terminated, False
-    killed = _signal_group(process.pid, signal.SIGKILL)
+    killed = child.force_stop()
     if reap and return_code is None:
-        return_code = process.wait(timeout=TERMINATION_GRACE_SECONDS)
+        return_code = child.process.wait(timeout=TERMINATION_GRACE_SECONDS)
     deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
-    if not _wait_group_absent(process.pid, deadline):
+    if not _wait_group_absent(child, deadline):
         raise OSError("worker process group did not exit")
     return return_code, terminated, killed
 
 
-def _signal_group(group: int, requested: signal.Signals) -> bool:
-    try:
-        os.killpg(group, requested)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def _wait_group_absent(group: int, deadline: float) -> bool:
+def _wait_group_absent(child: _Supervised, deadline: float) -> bool:
     while True:
-        try:
-            os.killpg(group, 0)
-        except (PermissionError, ProcessLookupError):  # Owned PGID is no longer signalable.
+        if child.gone():
             return True
         if (remaining := deadline - time.monotonic()) <= 0:
             return False
@@ -304,4 +418,12 @@ def _require_inventory(directory: Path, expected: set[str]) -> None:
 
 
 def _normalize(payload: bytes, owned_root: Path) -> str:
-    return payload.decode("utf-8", errors="replace").replace(str(owned_root), "<PARQUITY_TEMP>")
+    text = payload.decode("utf-8", errors="replace")
+    # A provider writes the path the way it likes, and on Windows that is not always the way
+    # str(Path) does: PyArrow reports 'C:/Users/...' where the owned root reads 'C:\\Users\\...'.
+    # Redacting only one spelling leaves the other in the evidence, which both discloses a local
+    # path and makes the detail -- and so the finding's identity -- change with every run, because
+    # the temporary root is named afresh each time.
+    for spelling in dict.fromkeys((str(owned_root), owned_root.as_posix())):
+        text = text.replace(spelling, "<PARQUITY_TEMP>")
+    return text

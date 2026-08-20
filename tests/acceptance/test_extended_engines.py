@@ -236,7 +236,7 @@ def test_fastparquet_direct_script_matches_adapter_schema_and_rows(
         runpy.run_path(str(script), run_name="__main__")
     output = capsys.readouterr().out
     records = [cast(dict[str, object], json.loads(line)) for line in output.splitlines()]
-    source = script.read_text()
+    source = script.read_text(encoding="utf-8")
     temporal = 'record("observe", "ERROR"' in source
     for index, dtype in enumerate(pandas_dtypes):
         if dtype is None:

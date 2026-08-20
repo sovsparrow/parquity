@@ -4,10 +4,16 @@ import errno
 import hashlib
 import os
 import stat
+import sys
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple
 
+from . import windows
 from .limits import MAX_FILE_BYTES, MAX_FILES, MAX_SOURCE_BYTES, MAX_VISITED_ENTRIES
+
+#: ERROR_INVALID_FUNCTION and ERROR_NOT_SUPPORTED, which is how a Windows volume says it
+#: cannot do what was asked rather than that the request was wrong.
+_WINDOWS_NO_FOLLOW_UNSUPPORTED = frozenset({1, 50})
 
 
 class ScanConfigurationError(ValueError):
@@ -118,9 +124,7 @@ def _directory_files(root: Path) -> tuple[tuple[DiscoveredFile, ...], int, int]:
                         raise _limit("visited directory entries exceed the 4,096-entry limit")
                     visited += 1
                     entry.name.encode("utf-8")
-                    entries.append(
-                        (entry.name, Path(entry.path), entry.stat(follow_symlinks=False))
-                    )
+                    entries.append((entry.name, Path(entry.path), _entry_status(entry)))
             entries.sort(key=lambda item: item[0].encode("utf-8"))
             child_directories: list[Path] = []
             for name, path, status in entries:
@@ -151,6 +155,17 @@ def _classify_entry(
         if len(found) > MAX_FILES:
             raise _limit("discovered file count exceeds 256")
     return 0
+
+
+def _entry_status(entry: os.DirEntry[str]) -> os.stat_result:
+    status = entry.stat(follow_symlinks=False)
+    if sys.platform == "win32" and not status.st_ino:
+        # A Windows directory entry carries no file index, so its device and inode read as zero.
+        # The snapshot compares this identity against one taken from the open handle, which does
+        # carry them, so a directory scan would report drift on every file. Take a real stat, which
+        # opens the file to read its index, and keep the two comparable.
+        status = os.stat(entry.path, follow_symlinks=False)
+    return status
 
 
 def _discovered(path: Path, relative_path: str, status: os.stat_result) -> DiscoveredFile:
@@ -195,6 +210,20 @@ def _digest(stream: BinaryIO, target: Path) -> tuple[str, int]:
 
 
 def _open_source(path: Path) -> int:
+    if sys.platform == "win32":
+        # FILE_FLAG_OPEN_REPARSE_POINT is the same guarantee O_NOFOLLOW gives: the reparse point
+        # is opened rather than followed, so the regular-file check below rejects it.
+        try:
+            return windows.open_without_following(path)
+        except OSError as error:
+            # A volume that cannot open a reparse point without following it is a platform
+            # limitation, the same one the POSIX branch reports below. Worth separating from
+            # drift, because drift is a claim that the user's file changed underneath the scan.
+            if error.winerror in _WINDOWS_NO_FOLLOW_UNSUPPORTED:
+                raise ScanConfigurationError(
+                    "SCAN_UNAVAILABLE", "scan input admission requires no-follow file access"
+                ) from error
+            raise _drift() from error
     try:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     except AttributeError as error:
@@ -221,7 +250,18 @@ def _identity(status: os.stat_result) -> FileIdentity:
         status.st_mode,
         status.st_size,
         status.st_mtime_ns,
-        status.st_ctime_ns,
+        # Windows puts the creation time in this field and reports it differently through a path
+        # than through an open handle, so comparing the two would fail every admission. What it
+        # guards against -- a file substituted between discovery and copy -- is already covered
+        # there: st_dev is the volume serial and st_ino the file ID, which together identify the
+        # file itself rather than the name it was reached by.
+        #
+        # `sys.platform`, not `windows.IS_WINDOWS`, and the same a few lines up. Which platform
+        # this is cannot change while the process runs, and reading it through a module attribute
+        # invites a test that means to disable the *worker's* containment to silently disable this
+        # too -- which is how one did, passing here and failing on a runner whose volume reports
+        # the discrepancy this line exists for.
+        0 if sys.platform == "win32" else status.st_ctime_ns,
     )
 
 

@@ -161,7 +161,7 @@ def test_profiled_run_replay_reproduction_and_atomic_precondition(
         for child in validated.children
         if child.finding.fingerprint.writer_profile is not None
     )
-    script = (profiled.directory / "upstream_repro.py").read_text()
+    script = (profiled.directory / "upstream_repro.py").read_text(encoding="utf-8")
     assert "options = {'row_group_offsets': 2}" in script
     assert "write_index=False, **options" in script
     assert "row_group_offsets=2" not in script
@@ -171,7 +171,9 @@ def test_profiled_run_replay_reproduction_and_atomic_precondition(
     run_bytes = run_path.read_bytes()
     run_data = cast(dict[str, object], json.loads(run_bytes))
     run_data.pop("writer_profiles")
-    run_path.write_text(json.dumps(run_data, sort_keys=True, separators=(",", ":")))
+    run_path.write_text(
+        json.dumps(run_data, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
     with pytest.raises(RunBundleValidationError):
         validate_run(destination)
     run_path.write_bytes(run_bytes)
@@ -179,7 +181,9 @@ def test_profiled_run_replay_reproduction_and_atomic_precondition(
     finding_bytes = finding_path.read_bytes()
     finding_data = cast(dict[str, object], json.loads(finding_bytes))
     finding_data.pop("writer_profiles")
-    finding_path.write_text(json.dumps(finding_data, sort_keys=True, separators=(",", ":")))
+    finding_path.write_text(
+        json.dumps(finding_data, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
     with pytest.raises(RunBundleValidationError):
         validate_run(destination)
     finding_path.write_bytes(finding_bytes)

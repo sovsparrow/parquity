@@ -123,11 +123,11 @@ def test_schema_loading_rejects_unreadable_malformed_wrong_format_and_non_empty_
         "wrong": tmp_path / "wrong.json",
         "rows": tmp_path / "rows.json",
     }
-    invalid["malformed"].write_text("{")
+    invalid["malformed"].write_text("{", encoding="utf-8")
     invalid["duplicate"].write_text(
-        '{"format":"parquity.case.v1","schema":[],"schema":[],"rows":[]}'
+        '{"format":"parquity.case.v1","schema":[],"schema":[],"rows":[]}', encoding="utf-8"
     )
-    invalid["wrong"].write_text('{"format":"other","schema":[],"rows":[]}')
+    invalid["wrong"].write_text('{"format":"other","schema":[],"rows":[]}', encoding="utf-8")
     case = Case((_field("value"),), ((1,),))
     invalid["rows"].write_bytes(case.canonical_bytes())
     for name, path in invalid.items():
@@ -189,7 +189,7 @@ def test_schema_loading_rejects_unreadable_malformed_wrong_format_and_non_empty_
     }
     for name, document in malformed_grammar.items():
         path = tmp_path / f"{name}.json"
-        path.write_text(json.dumps(document))
+        path.write_text(json.dumps(document), encoding="utf-8")
         with pytest.raises(SchemaProfileError) as raised:
             load_schema(path)
         assert raised.value.kind == "INVALID_SCHEMA"

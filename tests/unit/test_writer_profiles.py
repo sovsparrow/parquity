@@ -281,7 +281,7 @@ def test_artifact_verifier_distinguishes_invalid_artifacts_from_internal_failure
 ) -> None:
     profile = WriterProfileIdentity("compression-gzip", {"compression": "gzip"})
     malformed = tmp_path / "malformed.parquet"
-    malformed.write_text("not a parquet artifact")
+    malformed.write_text("not a parquet artifact", encoding="utf-8")
     for path in (tmp_path / "missing.parquet", malformed):
         with pytest.raises(contracts.WriterProfileContractViolation):
             contracts.verify_writer_profile_artifact(path, profile, 4)

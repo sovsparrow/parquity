@@ -118,7 +118,7 @@ def _artifact_failure(mode: str, directory: Path) -> int:
         (directory / "observation.arrow").write_bytes(artifact)
         control = _changed_control("SUCCESS", artifact, artifact_sha256=1)
     elif mode == "extra-artifact":
-        (directory / "unexpected").write_text("extra")
+        (directory / "unexpected").write_text("extra", encoding="utf-8")
         control = _control("PROVIDER_ERROR")
     elif mode == "artifact-directory":
         (directory / "observation.arrow").mkdir()

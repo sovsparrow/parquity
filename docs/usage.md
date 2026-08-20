@@ -35,11 +35,14 @@ Pass `--json` to force that canonical machine output on a terminal.
 
 ## Platform support
 
-Parquity supports Linux and macOS. Windows is not currently supported.
+Parquity supports Linux, macOS, and Windows.
 
-`scan` and replay of scan evidence require POSIX process-group supervision for
-timeouts and descendant cleanup. The pure-Python wheel may install on another
-platform; installation alone does not establish support for its commands.
+`scan` and replay of scan evidence contain each reader in a child process, and
+have to be able to reach whatever that child starts in order to time it out and
+clean up after it. POSIX does that with a process group; Windows does it with a
+job object, which also takes the tree down if the supervisor itself dies. Scan
+admission likewise refuses to follow a symlink into a file it was not given,
+through `O_NOFOLLOW` or `FILE_FLAG_OPEN_REPARSE_POINT`.
 
 ## Execution model
 
@@ -170,9 +173,6 @@ Directory discovery and retained evidence are bounded:
 Reaching the saved-evidence limit before every accepted file is evaluated is
 recorded as a non-exhaustive stop. The remaining accepted files are listed as
 not evaluated.
-
-Scan supervision currently requires a POSIX platform. Windows support is
-demand-driven; open an issue if you need it.
 
 These are discovery and retained-evidence bounds, not hard memory limits. They
 do not bound every allocation or decompression step performed inside a

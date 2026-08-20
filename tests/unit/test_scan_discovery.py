@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import os
 from collections.abc import Callable, Iterator
@@ -9,6 +10,7 @@ import pytest
 import parquity.scans.discovery as discovery_module
 import parquity.scans.supervision as process_module
 from parquity.engines import resolve_reader_selection
+from parquity.scans import windows
 from parquity.scans.discovery import (
     MAX_FILE_BYTES,
     MAX_FILES,
@@ -19,6 +21,7 @@ from parquity.scans.discovery import (
     snapshot_file,
 )
 from parquity.scans.workflow import execute_scan
+from tests.support import symlinks_available
 
 
 def _failure(function: Callable[..., object], *args: object) -> ScanConfigurationError:
@@ -33,15 +36,29 @@ def test_explicit_file_accepts_any_suffix_and_snapshot_binds_exact_bytes(
     source = tmp_path / "no-extension"
     payload = b"fixed parquet-shaped test bytes"
     source.write_bytes(payload)
+    # The snapshot must open the source exactly once, through whichever no-follow primitive the
+    # platform provides -- os.open with O_NOFOLLOW, or CreateFileW with OPEN_REPARSE_POINT.
     source_opens = 0
-    original_open = discovery_module.os.open
+    if windows.IS_WINDOWS:
+        original_without_following = discovery_module.windows.open_without_following
 
-    def recording_open(path: Path, flags: int) -> int:
-        nonlocal source_opens
-        source_opens += 1
-        return original_open(path, flags)
+        def recording_windows_open(path: Path) -> int:
+            nonlocal source_opens
+            source_opens += 1
+            return original_without_following(path)
 
-    monkeypatch.setattr(discovery_module.os, "open", recording_open)
+        monkeypatch.setattr(
+            discovery_module.windows, "open_without_following", recording_windows_open
+        )
+    else:
+        original_open = discovery_module.os.open
+
+        def recording_open(path: Path, flags: int) -> int:
+            nonlocal source_opens
+            source_opens += 1
+            return original_open(path, flags)
+
+        monkeypatch.setattr(discovery_module.os, "open", recording_open)
     discovery = discover_input(source)
     snapshot = snapshot_file(discovery.files[0], tmp_path / "private")
     status = source.lstat()
@@ -53,7 +70,9 @@ def test_explicit_file_accepts_any_suffix_and_snapshot_binds_exact_bytes(
         status.st_mode,
         status.st_size,
         status.st_mtime_ns,
-        status.st_ctime_ns,
+        # Windows reports the creation time here, and reports it differently through a path than
+        # through an open handle, so the identity deliberately leaves it out there.
+        0 if windows.IS_WINDOWS else status.st_ctime_ns,
     )
     assert source_opens == 1
     assert (snapshot.relative_path, snapshot.byte_count) == ("no-extension", len(payload))
@@ -67,7 +86,11 @@ def test_scan_fails_closed_when_process_group_isolation_is_unavailable(
 ) -> None:
     source = tmp_path / "source.parquet"
     source.write_bytes(b"not parquet")
-    monkeypatch.delattr(process_module.os, "killpg")
+    # Both containment mechanisms have to be out of reach for the refusal to be the one under
+    # test: the process group on POSIX, and the job object on Windows.
+    monkeypatch.setattr(process_module.windows, "IS_WINDOWS", False)
+    if hasattr(process_module.os, "killpg"):
+        monkeypatch.delattr(process_module.os, "killpg")
     with pytest.raises(ScanConfigurationError) as unavailable:
         execute_scan(
             source,
@@ -101,6 +124,8 @@ def test_directory_discovery_counts_ignored_entries_and_is_utf8_byte_sorted(
 
 
 def test_directory_does_not_follow_symlinks_and_reports_them(tmp_path: Path) -> None:
+    if not symlinks_available(tmp_path):
+        pytest.skip("creating a symlink requires a privilege this environment lacks")
     root = tmp_path / "input"
     outside = tmp_path / "outside"
     root.mkdir()
@@ -121,9 +146,10 @@ def test_empty_and_non_regular_inputs_are_configuration_errors(tmp_path: Path) -
     assert _failure(discover_input, empty).kind == "EMPTY_INPUT"
     missing = tmp_path / "missing"
     assert _failure(discover_input, missing).kind == "INVALID_INPUT"
-    fifo = tmp_path / "fifo"
-    os.mkfifo(fifo)
-    assert _failure(discover_input, fifo).kind == "INVALID_INPUT"
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        assert _failure(discover_input, fifo).kind == "INVALID_INPUT"
 
 
 def test_fixed_file_count_and_byte_limits_are_enforced_before_snapshot(tmp_path: Path) -> None:
@@ -179,7 +205,7 @@ def test_total_visited_entry_bound_precedes_additional_metadata_work(
     root = tmp_path / "input"
     root.mkdir()
     sample = tmp_path / "sample"
-    sample.write_text("ignored")
+    sample.write_text("ignored", encoding="utf-8")
     calls = [0] * MAX_VISITED_ENTRIES
     status = sample.lstat()
     entries = tuple(_Entry(index, status, calls) for index in range(len(calls)))
@@ -195,6 +221,8 @@ def test_total_visited_entry_bound_precedes_additional_metadata_work(
 
 
 def test_snapshot_refuses_source_drift(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    if not symlinks_available(tmp_path):
+        pytest.skip("creating a symlink requires a privilege this environment lacks")
     source = tmp_path / "source.parquet"
     source.write_bytes(b"before")
     item = discover_input(source).files[0]
@@ -219,6 +247,24 @@ def test_snapshot_refuses_source_drift(monkeypatch: pytest.MonkeyPatch, tmp_path
     source.unlink()
     source.write_bytes(b"original")
     unavailable = discover_input(source).files[0]
+
+    # A platform that cannot open a file without following a link into it is reported as
+    # unavailable rather than as drift, because drift claims the user's file changed. Each
+    # platform says so its own way: POSIX through a missing O_NOFOLLOW or an errno the flag is
+    # not supported under, Windows through ERROR_NOT_SUPPORTED out of CreateFileW.
+    if windows.IS_WINDOWS:
+
+        def unsupported_without_following(path: Path) -> int:
+            del path
+            raise OSError(discovery_module.errno.EINVAL, "unsupported", None, 50)
+
+        monkeypatch.setattr(
+            discovery_module.windows, "open_without_following", unsupported_without_following
+        )
+        unsupported_kind = _failure(snapshot_file, unavailable, tmp_path / "unsupported").kind
+        assert unsupported_kind == "SCAN_UNAVAILABLE"
+        return
+
     with monkeypatch.context() as patch:
         patch.delattr(discovery_module.os, "O_NOFOLLOW")
         assert _failure(snapshot_file, unavailable, tmp_path / "missing-primitive").kind == (
@@ -254,3 +300,22 @@ def test_snapshot_distinguishes_source_reads_from_target_operations(
         patch.setattr(type(source), "open", target_open)
         target_failure = _failure(snapshot_file, item, tmp_path / "target-write")
     assert target_failure.kind == "OUTPUT_ERROR"
+
+
+@pytest.mark.skipif(not windows.IS_WINDOWS, reason="CreateFileW is the Windows admission primitive")
+def test_windows_open_reports_the_real_error_and_returns_the_exact_bytes(tmp_path: Path) -> None:
+    # Both halves are regressions. Undeclared, ctypes gives CreateFileW a C int return, so a
+    # failure arrives as -1 rather than INVALID_HANDLE_VALUE and slips past the check into
+    # open_osfhandle, which reports EBADF -- a bad descriptor where the truth is a missing file.
+    # And a kernel32 without use_last_error leaves get_last_error reading a copy nothing writes,
+    # so the WinError that does get raised says the operation completed successfully.
+    with pytest.raises(FileNotFoundError) as missing:
+        windows.open_without_following(tmp_path / "absent.parquet")
+    # ENOENT rather than the EBADF open_osfhandle used to raise, which is the regression itself.
+    assert missing.value.errno == errno.ENOENT
+
+    source = tmp_path / "present.parquet"
+    payload = b"fixed parquet-shaped test bytes"
+    source.write_bytes(payload)
+    with os.fdopen(windows.open_without_following(source), "rb") as handle:
+        assert handle.read() == payload

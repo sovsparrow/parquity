@@ -27,6 +27,15 @@ class _ParquetModule(Protocol):
 _PARQUET = cast(_ParquetModule, cast(object, pq))
 
 
+# Not every PyArrow failure is an ArrowException. A truncated or self-inconsistent file surfaces
+# as a plain OSError -- `pq.read_table` on `fixed_length_byte_array.parquet` from the vendored
+# corpus raises `OSError: Unexpected end of stream`, whose mro does not include ArrowException at
+# all. Uncaught, it escapes the adapter: `scan` reports it as an INTERNAL_ERROR and abandons every
+# observation it had already made. `ArrowIOError` derives from `IOError`, so this is PyArrow
+# reporting an I/O failure the way it documents rather than anything exotic.
+_FAILURES = (pa.ArrowException, OSError)
+
+
 @dataclass(frozen=True, slots=True)
 class PyArrowEngine:
     identity: EngineIdentity
@@ -34,7 +43,7 @@ class PyArrowEngine:
     def write(self, table: pa.Table, path: Path) -> None:
         try:
             _PARQUET.write_table(table, path)
-        except pa.ArrowException as error:
+        except _FAILURES as error:
             raise ProviderOperationError(self.identity.name, "write", error) from error
 
     def writer_profile(self, name: str) -> WriterProfileIdentity | None:
@@ -52,13 +61,13 @@ class PyArrowEngine:
             raise ValueError("writer profile does not match the PyArrow translation")
         try:
             _PARQUET.write_table(table, path, **profile.effective_options)
-        except (pa.ArrowException, TypeError, ValueError) as error:
+        except (*_FAILURES, TypeError, ValueError) as error:
             raise ProviderOperationError(self.identity.name, "write", error) from error
 
     def read(self, path: Path) -> pa.Table:
         try:
             return _PARQUET.read_table(path)
-        except pa.ArrowException as error:
+        except _FAILURES as error:
             raise ProviderOperationError(self.identity.name, "read", error) from error
 
 

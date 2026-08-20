@@ -219,3 +219,23 @@ def test_a_timeout_is_reported_where_the_remedy_is_and_saves_no_finding(
     assert error["kind"] == "EXTERNAL_ENGINE_TIMEOUT"
     assert "did not answer" in cast(str, error["detail"])
     assert "finding_count" not in payload and not destination.exists()
+
+
+def test_scan_refuses_an_external_engine_rather_than_running_one_it_cannot_classify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Scan reads its files inside a worker whose contract was written for an in-process provider.
+    # A bridge works there on the happy path, which is the problem: it would look supported right
+    # up until one stopped answering, and the worker has nothing mapped to ReaderOutcomeKind
+    # .TIMEOUT. Refusing the selection keeps the documented scope enforced rather than described.
+    bridge.configure(monkeypatch, tmp_path)
+    source = tmp_path / "input.parquet"
+    source.write_bytes(b"not parquet")
+
+    selection = ["--engines", f"pyarrow,{bridge.NAME}", "--out", str(tmp_path / "out"), "--json"]
+    assert cli.main(["scan", str(source), *selection]) == 2
+    payload, _ = captured_payload(capsys)
+    error = cast(dict[str, object], payload["error"])
+    assert error["kind"] == "ENGINE_CAPABILITY_ERROR"
+    assert bridge.NAME in cast(str, error["detail"])
+    assert not (tmp_path / "out").exists()

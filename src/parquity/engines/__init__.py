@@ -259,8 +259,23 @@ def resolve_reader_selection(
     reader_names: str | Sequence[str] | None,
     descriptors: Sequence[EngineDescriptor] | None = None,
 ) -> ReaderSelection:
+    """Resolves the readers for `scan`, which external engines may not join.
+
+    Reader-only selection is what `scan` and replay of scan evidence use, and scan reads its files
+    inside a worker with its own contract: a bridge that stops answering is classified there by
+    rules written for an in-process provider, and `ReaderOutcomeKind.TIMEOUT` has nothing mapped to
+    it. Rather than let that be discovered from a confusing run, an external engine is refused
+    here until the scan worker knows what to do with one.
+    """
     selected = _selected(descriptors)
     names = _canonical_names(reader_names, "reader", selected)
+    by_name = {descriptor.name: descriptor for descriptor in selected}
+    external = [name for name in names if by_name[name].tier == EXTERNAL_TIER]
+    if external:
+        raise EngineSelectionError(
+            "ENGINE_CAPABILITY_ERROR",
+            f"external engines are not available to scan: {', '.join(external)}",
+        )
     resolutions = resolve_engines(names, selected)
     _require_available(resolutions)
     readers: list[EngineReader] = []

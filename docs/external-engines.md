@@ -182,8 +182,12 @@ error otherwise, not a smaller matrix.
 
 ## Scope
 
-External engines participate in `check`, `fuzz`, and `engines`. They are not
-yet available to `scan`, whose reader isolation has its own worker contract.
+External engines participate in `check`, `fuzz`, and `engines`. They are
+refused by `scan`, which reads each file inside a worker with its own contract:
+a bridge that stops answering would be classified there by rules written for an
+in-process provider, and scan's `TIMEOUT` outcome has nothing mapped to it. The
+refusal is a selection error, so asking for one is reported rather than
+silently ignored.
 
 Parquity does not install, build, or version-manage a bridge. It executes the
 command it is given, and it reports what that command does.

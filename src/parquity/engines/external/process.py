@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from ...process import ProcessUnavailableError, run_process
 from .protocol import MAX_STREAM_BYTES, ExternalEngineProtocolError
 
 MAX_DETAIL_BYTES = 2048
@@ -26,21 +26,22 @@ def run_bridge(
 ) -> BridgeOutcome:
     argv = (*command, *arguments)
     try:
-        completed = subprocess.run(  # noqa: S603 - configured shell-free bridge argv.
+        completed = run_process(
             argv,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
+            timeout_seconds=timeout_seconds,
+            stdout_limit=MAX_STREAM_BYTES,
+            stderr_limit=MAX_STREAM_BYTES,
         )
-    except subprocess.TimeoutExpired as expired:
-        return BridgeOutcome(-1, b"", _text(expired.stderr), True)
-    except OSError as error:
+    except (OSError, ProcessUnavailableError) as error:
         raise BridgeUnavailableError(f"bridge command could not be executed: {error}") from error
-    stdout = completed.stdout
-    if len(stdout) > MAX_STREAM_BYTES:
+    if not completed.timed_out and completed.stdout_truncated:
         raise ExternalEngineProtocolError(f"bridge stdout exceeds {MAX_STREAM_BYTES} bytes")
-    return BridgeOutcome(completed.returncode, stdout, _text(completed.stderr), False)
+    return BridgeOutcome(
+        completed.return_code,
+        completed.stdout,
+        _text(completed.stderr),
+        completed.timed_out,
+    )
 
 
 def _text(payload: bytes | str | None) -> str:

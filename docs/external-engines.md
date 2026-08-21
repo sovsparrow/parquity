@@ -180,25 +180,19 @@ same way it is reported for a Python provider. Replaying evidence that names an
 external engine requires that engine to be configured; it is a configuration
 error otherwise, not a smaller matrix.
 
-## What running a bridge does and does not do for you
+## Process isolation
 
-Parquity runs a bridge as an ordinary subprocess. Two limits follow from that,
-and neither is hidden by anything above.
+Parquity runs each bridge inside a contained process tree. If a request reaches
+its timeout, Parquity stops the bridge and anything it started, verifies that
+the tree is gone, and then returns the timeout.
 
-**A timeout terminates the bridge, not everything the bridge started.** If a
-bridge spawns its own helper processes — a JVM, a worker pool, a container —
-those are not tracked, and a bridge killed at its deadline may leave them
-running. Reap what you start, or make sure a bridge's children die with it.
+Stdout and stderr are drained concurrently and kept under fixed limits while
+the bridge runs. Output beyond those limits is discarded rather than held in
+memory. An oversized stdout response is a protocol error because a truncated
+control object cannot be interpreted safely.
 
-**Output is bounded after it is read, not while it is being read.** Parquity
-reads a bridge's stdout and stderr to completion and then enforces the 64 KiB
-limit, so a bridge that writes far more than that has already been held in
-memory by the time the limit is applied. The limit protects the evidence, not
-the machine. Keep diagnostics small.
-
-Both are properties of how the bridge is run rather than of the contract, and
-both are tracked upstream in
-[#12](https://github.com/sovsparrow/parquity/issues/12).
+These are execution guarantees, not part of `parquity.bridge.v1`; the bridge
+protocol and its evidence remain unchanged.
 
 ## Scope
 

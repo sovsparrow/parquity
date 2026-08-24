@@ -10,10 +10,9 @@ from typing import IO, cast
 
 import pytest
 
-import parquity.scans.supervision as process_module
+import parquity.process as process_module
 import parquity.scans.workflow as workflow_module
 from parquity.engines import resolve_reader_selection
-from parquity.scans import windows
 from parquity.scans.discovery import DiscoveredFile, ScanConfigurationError, Snapshot
 from parquity.scans.supervision import (
     WorkerInternalError,
@@ -71,11 +70,13 @@ def test_timeout_terminates_reaps_drains_and_removes_resources(tmp_path: Path) -
     assert outcome.kind == "TIMEOUT"
     # POSIX asks the group to stop before killing it. Windows has no polite equivalent for a
     # process tree, so the outcome records a kill instead of pretending otherwise.
-    assert outcome.killed if windows.IS_WINDOWS else outcome.terminated
+    assert outcome.killed if process_module.IS_WINDOWS else outcome.terminated
     assert not (tmp_path / "worker").exists()
 
 
-@pytest.mark.skipif(windows.IS_WINDOWS, reason="signal escalation is a POSIX process-group path")
+@pytest.mark.skipif(
+    process_module.IS_WINDOWS, reason="signal escalation is a POSIX process-group path"
+)
 def test_timeout_kills_a_resistant_descendant_and_reaps_the_direct_child(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -110,6 +111,25 @@ def _require_process_absent(pid: int) -> None:
             return
         time.sleep(0.01)
     raise AssertionError(f"process {pid} still exists")
+
+
+def test_shared_capture_bounds_both_streams_while_draining_them() -> None:
+    stdout_limit, stderr_limit = 1024, 2048
+    outcome = process_module.run_process(
+        [
+            sys.executable,
+            "-c",
+            "import os; os.write(1, b'x' * 8192); os.write(2, b'y' * 12288)",
+        ],
+        timeout_seconds=5,
+        stdout_limit=stdout_limit,
+        stderr_limit=stderr_limit,
+    )
+
+    assert outcome.return_code == 0 and not outcome.timed_out
+    assert outcome.stdout == b"x" * stdout_limit
+    assert outcome.stderr == b"y" * stderr_limit
+    assert outcome.stdout_truncated and outcome.stderr_truncated
 
 
 def test_scan_spawns_one_real_child_per_engine_file_and_none_after_refusal(
@@ -300,12 +320,12 @@ class _RecordingProcess:
         return result
 
 
-@pytest.mark.skipif(not windows.IS_WINDOWS, reason="job objects are the Windows containment")
+@pytest.mark.skipif(not process_module.IS_WINDOWS, reason="job objects are the Windows containment")
 def test_a_job_contains_a_descendant_and_terminating_it_reaches_the_whole_tree() -> None:
     # The guarantee POSIX gets from a process group: whatever the worker starts is reachable when
     # the supervisor gives up. Asserted through the job's own accounting rather than by probing
     # process liveness, since os.kill cannot ask that question on Windows without answering it.
-    job = windows.ProcessJob()
+    job = process_module._ProcessJob()  # pyright: ignore[reportPrivateUsage]
     try:
         child = process_module.subprocess.Popen(
             [
@@ -318,7 +338,7 @@ def test_a_job_contains_a_descendant_and_terminating_it_reaches_the_whole_tree()
             stdin=process_module.subprocess.DEVNULL,
             stdout=process_module.subprocess.DEVNULL,
             stderr=process_module.subprocess.DEVNULL,
-            creationflags=windows.CREATE_NEW_PROCESS_GROUP,
+            creationflags=process_module.CREATE_NEW_PROCESS_GROUP,
         )
         assert job.assign(child.pid)
 
@@ -337,7 +357,7 @@ def test_a_job_contains_a_descendant_and_terminating_it_reaches_the_whole_tree()
         job.close()
 
 
-@pytest.mark.skipif(not windows.IS_WINDOWS, reason="job containment is the Windows path")
+@pytest.mark.skipif(not process_module.IS_WINDOWS, reason="job containment is the Windows path")
 def test_worker_is_contained_before_it_runs_any_of_its_own_code(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -350,26 +370,29 @@ def test_worker_is_contained_before_it_runs_any_of_its_own_code(
     # version of this test passed with the flag removed and proved nothing.
     private = tmp_path / "worker"
     observed: list[tuple[int, tuple[str, ...]]] = []
-    original = process_module.windows.resume_process
+    original = process_module._resume_process  # pyright: ignore[reportPrivateUsage]
 
     def observing_resume(pid: int) -> int:
         suspended = original(pid)
         observed.append((suspended, tuple(sorted(path.name for path in private.iterdir()))))
         return suspended
 
-    monkeypatch.setattr(process_module.windows, "resume_process", observing_resume)
+    monkeypatch.setattr(process_module, "_resume_process", observing_resume)
     assert _run("success", tmp_path).kind == "SUCCESS"
     # One thread, found suspended, having written nothing.
     assert observed == [(1, ())]
 
 
-@pytest.mark.skipif(not windows.IS_WINDOWS, reason="job containment is the Windows path")
+@pytest.mark.skipif(not process_module.IS_WINDOWS, reason="job containment is the Windows path")
 def test_a_refused_assignment_stops_rather_than_supervising_an_uncontained_worker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Carrying on would supervise a worker the job does not hold, and a timeout would then
     # terminate an empty job and report the tree gone while it is still running.
-    def refuse(self: windows.ProcessJob, pid: int) -> bool:
+    def refuse(
+        self: process_module._ProcessJob,  # pyright: ignore[reportPrivateUsage]
+        pid: int,
+    ) -> bool:
         del self, pid
         return False
 
@@ -379,8 +402,12 @@ def test_a_refused_assignment_stops_rather_than_supervising_an_uncontained_worke
         resumed.append(pid)
         return 1
 
-    monkeypatch.setattr(windows.ProcessJob, "assign", refuse)
-    monkeypatch.setattr(process_module.windows, "resume_process", recording_resume)
+    monkeypatch.setattr(
+        process_module._ProcessJob,  # pyright: ignore[reportPrivateUsage]
+        "assign",
+        refuse,
+    )
+    monkeypatch.setattr(process_module, "_resume_process", recording_resume)
     with pytest.raises(WorkerInternalError) as refused:
         _run("success", tmp_path)
     assert "containment" in str(refused.value)
@@ -388,7 +415,7 @@ def test_a_refused_assignment_stops_rather_than_supervising_an_uncontained_worke
     assert not (tmp_path / "worker").exists()
 
 
-@pytest.mark.skipif(not windows.IS_WINDOWS, reason="job containment is the Windows path")
+@pytest.mark.skipif(not process_module.IS_WINDOWS, reason="job containment is the Windows path")
 def test_a_failure_to_resume_is_reported_like_any_other_startup_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -399,7 +426,7 @@ def test_a_failure_to_resume_is_reported_like_any_other_startup_failure(
         del pid
         raise OSError(errno.EACCES, "controlled snapshot failure", None, 5)
 
-    monkeypatch.setattr(process_module.windows, "resume_process", refuse)
+    monkeypatch.setattr(process_module, "_resume_process", refuse)
     with pytest.raises(WorkerInternalError) as failure:
         _run("success", tmp_path)
     assert "resumed" in str(failure.value)

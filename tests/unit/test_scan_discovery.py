@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+import parquity.process as process_module
 import parquity.scans.discovery as discovery_module
-import parquity.scans.supervision as process_module
 from parquity.engines import resolve_reader_selection
 from parquity.scans import windows
 from parquity.scans.discovery import (
@@ -88,7 +88,7 @@ def test_scan_fails_closed_when_process_group_isolation_is_unavailable(
     source.write_bytes(b"not parquet")
     # Both containment mechanisms have to be out of reach for the refusal to be the one under
     # test: the process group on POSIX, and the job object on Windows.
-    monkeypatch.setattr(process_module.windows, "IS_WINDOWS", False)
+    monkeypatch.setattr(process_module, "IS_WINDOWS", False)
     if hasattr(process_module.os, "killpg"):
         monkeypatch.delattr(process_module.os, "killpg")
     with pytest.raises(ScanConfigurationError) as unavailable:

@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import os
 import shutil
-import signal
 import stat
-import subprocess
-import threading
-import time
 from collections.abc import Sequence
-from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, cast
+from typing import NamedTuple, cast
 
 from ..configuration import scan_timeout_is_valid
 from ..evidence import digest_matches
-from . import windows
+from ..process import (
+    ProcessOutcome,
+    ProcessSupervisionError,
+    ProcessUnavailableError,
+    run_process,
+)
 from .control import (
     ARTIFACT_NAME,
     CONTROL_NAME,
@@ -26,8 +24,6 @@ from .control import (
 from .limits import MAX_OBSERVATION_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES
 from .observations import ObservationMetadata
 from .records import ReaderOutcomeKind
-
-TERMINATION_GRACE_SECONDS = 1.0
 
 
 class WorkerInternalError(RuntimeError): ...
@@ -53,25 +49,6 @@ class WorkerOutcome(NamedTuple):
     killed: bool = False
 
 
-@dataclass(slots=True)
-class _Capture:
-    limit: int
-    payload: bytearray
-    truncated: bool = False
-    error: OSError | None = None
-
-    def drain(self, stream: BinaryIO) -> None:
-        try:
-            while chunk := stream.read(8192):
-                available = max(0, self.limit - len(self.payload))
-                self.payload.extend(chunk[:available])
-                self.truncated = self.truncated or len(chunk) > available
-        except OSError as error:
-            self.error = error
-        finally:
-            stream.close()
-
-
 def run_worker_process(
     argv: Sequence[str],
     private_directory: Path,
@@ -83,8 +60,6 @@ def run_worker_process(
 ) -> WorkerOutcome:
     if not scan_timeout_is_valid(timeout_seconds):
         raise ValueError("worker timeout must be in [1, 300]")
-    if not windows.IS_WINDOWS and (os.name != "posix" or not hasattr(os, "killpg")):
-        raise WorkerUnavailableError("worker process-group isolation is unavailable")
     try:
         private_directory.mkdir()
     except OSError as error:
@@ -109,56 +84,39 @@ def _execute(
     timeout: int,
     owned_root: Path,
 ) -> WorkerOutcome:
-    supervised = _spawn(argv)
     try:
-        return _supervise(supervised, private_directory, engine, version, timeout, owned_root)
-    finally:
-        # Closing the job is what releases the containment, and on Windows it also kills anything
-        # still inside it, so it happens however this returns.
-        supervised.release()
+        outcome = run_process(
+            argv,
+            timeout_seconds=timeout,
+            stdout_limit=MAX_STDOUT_BYTES,
+            stderr_limit=MAX_STDERR_BYTES,
+        )
+    except ProcessUnavailableError as error:
+        raise WorkerUnavailableError(str(error)) from error
+    except OSError as error:
+        raise WorkerInternalError("worker process could not be started") from error
+    except ProcessSupervisionError as error:
+        cause = error.__cause__ if isinstance(error.__cause__, OSError) else error
+        raise WorkerInternalError(f"worker supervision failed: {error}") from cause
+    return _interpret_process(outcome, private_directory, engine, version, owned_root)
 
 
-def _supervise(
-    process: _Supervised,
+def _interpret_process(
+    outcome: ProcessOutcome,
     private_directory: Path,
     engine: str,
     version: str,
-    timeout: int,
     owned_root: Path,
 ) -> WorkerOutcome:
-    stdout = _Capture(MAX_STDOUT_BYTES, bytearray())
-    stderr = _Capture(MAX_STDERR_BYTES, bytearray())
-    streams = (cast(BinaryIO, process.process.stdout), cast(BinaryIO, process.process.stderr))
-    threads = tuple(
-        threading.Thread(target=capture.drain, args=(stream,), daemon=True)
-        for capture, stream in zip((stdout, stderr), streams, strict=True)
-    )
-    for thread in threads:
-        thread.start()
-    try:
-        state = _wait_for_process(process, timeout)
-    finally:
-        for thread in threads:
-            thread.join(TERMINATION_GRACE_SECONDS)
-    drain_failed = any(thread.is_alive() for thread in threads) or stdout.error or stderr.error
-    if drain_failed:
-        try:
-            _shutdown_group(process, reap=False)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise WorkerInternalError("worker streams could not be drained") from error
-        for thread in threads:
-            thread.join(TERMINATION_GRACE_SECONDS)
-        raise WorkerInternalError("worker streams could not be drained")
-    return_code, timed_out, terminated, killed = state
-    normalized_stderr = _normalize(bytes(stderr.payload), owned_root)
+    normalized_stderr = _normalize(outcome.stderr, owned_root)
     encoded_stderr = normalized_stderr.encode("utf-8")
     retained_stderr = encoded_stderr[:MAX_STDERR_BYTES].decode("utf-8", errors="ignore")
-    stderr_truncated = stderr.truncated or len(encoded_stderr) > MAX_STDERR_BYTES
-    if timed_out or return_code:
-        if not timed_out and _control_present(private_directory):
+    stderr_truncated = outcome.stderr_truncated or len(encoded_stderr) > MAX_STDERR_BYTES
+    if outcome.timed_out or outcome.return_code:
+        if not outcome.timed_out and _control_present(private_directory):
             _read_control(private_directory, engine, version)
             raise WorkerProtocolError("worker control record conflicts with its exit status")
-        kind = ReaderOutcomeKind.TIMEOUT if timed_out else ReaderOutcomeKind.PROCESS_ERROR
+        kind = ReaderOutcomeKind.TIMEOUT if outcome.timed_out else ReaderOutcomeKind.PROCESS_ERROR
         values = (
             kind,
             engine,
@@ -168,7 +126,7 @@ def _supervise(
             retained_stderr,
             stderr_truncated,
         )
-        return WorkerOutcome(*values, terminated=terminated, killed=killed)
+        return WorkerOutcome(*values, terminated=outcome.terminated, killed=outcome.killed)
     control = _read_control(private_directory, engine, version)
     detail = _normalize(control.detail.encode(), owned_root)
     failures = {
@@ -222,173 +180,6 @@ def _read_control(directory: Path, engine: str, version: str) -> WorkerControl:
     if control.engine != engine or control.engine_version != version:
         raise WorkerProtocolError("worker control identity does not match the request")
     return control
-
-
-@dataclass(slots=True)
-class _Supervised:
-    """A worker and the boundary that contains whatever it starts.
-
-    POSIX puts the worker in its own session, so the tree is reachable through its process group.
-    Windows has no process group that survives across processes, so the worker is placed in a job
-    object instead, which terminates the tree the same way and, because it is created with
-    KILL_ON_JOB_CLOSE, still does so if this supervisor dies first.
-    """
-
-    process: subprocess.Popen[bytes]
-    job: windows.ProcessJob | None = None
-
-    def request_stop(self) -> bool:
-        """Asks the tree to exit. Windows has no polite equivalent, so it reports no attempt."""
-        if self.job is not None:
-            return False
-        try:
-            os.killpg(self.process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return False
-        return True
-
-    def force_stop(self) -> bool:
-        """Kills the tree outright."""
-        if self.job is not None:
-            return self.job.terminate()
-        try:
-            os.killpg(self.process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return False
-        return True
-
-    def gone(self) -> bool:
-        """Whether nothing of the tree remains."""
-        if self.job is not None:
-            return self.job.active() == 0
-        try:
-            os.killpg(self.process.pid, 0)
-        except (PermissionError, ProcessLookupError):  # Owned PGID is no longer signalable.
-            return True
-        return False
-
-    def release(self) -> None:
-        if self.job is not None:
-            self.job.close()
-
-
-def _spawn(argv: Sequence[str]) -> _Supervised:
-    job = None
-    try:
-        job = windows.ProcessJob() if windows.IS_WINDOWS else None
-        process = subprocess.Popen(  # noqa: S603 - caller supplies a shell-free worker argv.
-            list(argv),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            # Both are named on both platforms and each is inert on the one it does not belong to.
-            # A new session on POSIX is what makes the process group reachable; a new process group
-            # on Windows keeps a console signal aimed at this process from reaching the worker,
-            # where containment itself is the job object's job.
-            start_new_session=not windows.IS_WINDOWS,
-            creationflags=_creation_flags(),
-        )
-    except OSError as error:
-        if job is not None:
-            job.close()
-        raise WorkerInternalError("worker process could not be started") from error
-    if job is None:
-        return _Supervised(process, None)
-    return _contain(process, job)
-
-
-def _creation_flags() -> int:
-    if not windows.IS_WINDOWS:
-        return 0
-    # Suspended, so that the worker exists -- and can therefore be placed in the job -- before it
-    # has run any code of its own. Assigning a running process leaves a window in which anything
-    # it starts is created outside the job, and POSIX has no equivalent window because
-    # start_new_session is applied as part of starting the process rather than after it.
-    return windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED
-
-
-def _contain(process: subprocess.Popen[bytes], job: windows.ProcessJob) -> _Supervised:
-    """Places a suspended worker in its job and starts it, or leaves nothing behind."""
-    try:
-        if not job.assign(process.pid):
-            # The worker is suspended, so it cannot have exited and cannot have started anything.
-            # A refusal here is a real failure to contain, and continuing would supervise a worker
-            # the job does not hold: a timeout would terminate an empty job and then report the
-            # tree gone while it is still running.
-            raise WorkerInternalError("worker could not be placed in its containment job")
-        if not windows.resume_process(process.pid):
-            # Zero means no thread was found suspended, so the worker had already been running
-            # while it was being assigned -- the very window creating it suspended exists to
-            # close. Refusing here keeps that guarantee checked rather than assumed.
-            raise WorkerInternalError("worker was not suspended while it was being contained")
-    except OSError as error:
-        # `resume_process` raises WinError if the thread snapshot cannot be taken, and a bare
-        # OSError here would be the one startup failure reported differently from every other.
-        _discard(process)
-        job.close()
-        raise WorkerInternalError("worker could not be resumed once contained") from error
-    except BaseException:
-        _discard(process)
-        job.close()
-        raise
-    return _Supervised(process, job)
-
-
-def _discard(process: subprocess.Popen[bytes]) -> None:
-    """Kills a worker that was never contained, and closes what was opened for it."""
-    with suppress(OSError):
-        process.kill()
-    with suppress(OSError, subprocess.TimeoutExpired):
-        process.wait(timeout=TERMINATION_GRACE_SECONDS)
-    for stream in (process.stdout, process.stderr):
-        if stream is not None:
-            with suppress(OSError):
-                stream.close()
-
-
-def _wait_for_process(child: _Supervised, timeout: int) -> tuple[int, bool, bool, bool]:
-    try:
-        try:
-            return child.process.wait(timeout=float(timeout)), False, False, False
-        except subprocess.TimeoutExpired:
-            pass
-        return_code, terminated, killed = _shutdown_group(child, reap=True)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        with suppress(OSError):
-            child.force_stop()
-        if child.process.returncode is None:
-            with suppress(OSError, subprocess.TimeoutExpired):
-                child.process.wait(timeout=TERMINATION_GRACE_SECONDS)
-        raise WorkerInternalError("worker process group could not be shut down") from error
-    return cast(int, return_code), True, terminated, killed
-
-
-def _shutdown_group(child: _Supervised, *, reap: bool) -> tuple[int | None, bool, bool]:
-    deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
-    terminated = child.request_stop()
-    return_code: int | None = None
-    if reap:
-        with suppress(subprocess.TimeoutExpired):
-            return_code = child.process.wait(timeout=TERMINATION_GRACE_SECONDS)
-    if _wait_group_absent(child, deadline) and (return_code is not None or not reap):
-        return return_code, terminated, False
-    killed = child.force_stop()
-    if reap and return_code is None:
-        return_code = child.process.wait(timeout=TERMINATION_GRACE_SECONDS)
-    deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
-    if not _wait_group_absent(child, deadline):
-        raise OSError("worker process group did not exit")
-    return return_code, terminated, killed
-
-
-def _wait_group_absent(child: _Supervised, deadline: float) -> bool:
-    while True:
-        if child.gone():
-            return True
-        if (remaining := deadline - time.monotonic()) <= 0:
-            return False
-        time.sleep(min(0.01, remaining))
 
 
 def _validated_artifact(directory: Path, metadata: ObservationMetadata) -> bytes:

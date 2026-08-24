@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+from pathlib import Path
 
 import pytest
 
+from parquity.engines.external import process as bridge_process
 from parquity.engines.external.process import BridgeUnavailableError, diagnostic, run_bridge
 from parquity.engines.external.protocol import (
     BRIDGE_PROTOCOL,
@@ -14,6 +18,7 @@ from parquity.engines.external.protocol import (
     parse_info,
     parse_success,
 )
+from parquity.process import IS_WINDOWS, ProcessSupervisionError
 from tests.support import external_engine as bridge
 
 _INFO: dict[str, object] = {
@@ -156,9 +161,62 @@ def test_a_bridge_that_exceeds_its_timeout_is_reported_as_timed_out(
     assert outcome.timed_out
 
 
+def test_oversized_bridge_stdout_is_rejected_without_retaining_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARQUITY_TEST_BRIDGE_FAULT", "oversized-stdout")
+
+    with pytest.raises(ExternalEngineProtocolError, match="stdout exceeds"):
+        run_bridge(bridge.bridge_command(), ("read",), 30)
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="PID absence probing is the POSIX assertion")
+def test_bridge_timeout_returns_after_its_resistant_descendant_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready"
+    monkeypatch.setenv("PARQUITY_TEST_BRIDGE_FAULT", "descendant")
+    monkeypatch.setenv("PARQUITY_TEST_BRIDGE_READY", str(ready))
+
+    outcome = run_bridge(bridge.bridge_command(), ("read",), 2)
+
+    direct, descendant = (int(value) for value in ready.read_text(encoding="utf-8").split())
+    assert outcome.timed_out
+    _require_process_absent(direct)
+    _require_process_absent(descendant)
+
+
+def _require_process_absent(pid: int) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"process {pid} still exists")
+
+
 def test_a_command_that_cannot_be_executed_is_reported_as_unavailable() -> None:
     with pytest.raises(BridgeUnavailableError, match="could not be executed"):
         run_bridge(("./no-such-bridge-executable",), ("info",), 30)
+
+
+def test_a_process_supervision_failure_is_reported_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervision_error = ProcessSupervisionError("process tree could not be shut down")
+
+    def fail_supervision(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise supervision_error
+
+    monkeypatch.setattr(bridge_process, "run_process", fail_supervision)
+
+    with pytest.raises(BridgeUnavailableError, match="could not be supervised") as raised:
+        run_bridge(("bridge",), ("info",), 30)
+    assert raised.value.__cause__ is supervision_error
 
 
 def test_diagnostics_join_a_detail_with_a_bounded_stderr_tail() -> None:

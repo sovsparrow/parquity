@@ -7,6 +7,11 @@ and package releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound external-engine output while it is captured and clean up the full
+  process tree before a timed-out bridge returns.
+
 ## [0.2.2] - 2026-08-20
 
 ### Fixed

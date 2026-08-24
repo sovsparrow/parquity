@@ -1,14 +1,16 @@
 """A controllable ``parquity.bridge.v1`` implementation, run as a real subprocess.
 
 Faults are selected through ``PARQUITY_TEST_BRIDGE_FAULT`` so a test can drive one behaviour
-without a second program. Every path terminates immediately; nothing here waits on input.
+without a second program. Blocking paths are bounded by the supervising test.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -97,6 +99,28 @@ def _slow() -> int:
     return 0
 
 
+def _oversized_stdout() -> int:
+    os.write(1, b"x" * (64 * 1024 + 1))
+    return 0
+
+
+def _descendant() -> int:
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, threading; "
+            "signal.signal(signal.SIGTERM, lambda signum, frame: None); "
+            "threading.Event().wait()",
+        ],
+        stdin=subprocess.DEVNULL,
+    )
+    ready = Path(os.environ["PARQUITY_TEST_BRIDGE_READY"])
+    ready.write_text(f"{os.getpid()} {child.pid}", encoding="utf-8")
+    threading.Event().wait()
+    return 0
+
+
 OPERATION_FAULTS: dict[str, Callable[[], int]] = {
     "provider": _provider,
     "reject": _reject,
@@ -105,6 +129,8 @@ OPERATION_FAULTS: dict[str, Callable[[], int]] = {
     "crash": _crash,
     "malformed-failure": _malformed_failure,
     "slow": _slow,
+    "oversized-stdout": _oversized_stdout,
+    "descendant": _descendant,
 }
 
 

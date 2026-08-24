@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from parquity.engines.external import process as bridge_process
 from parquity.engines.external.process import BridgeUnavailableError, diagnostic, run_bridge
 from parquity.engines.external.protocol import (
     BRIDGE_PROTOCOL,
@@ -17,7 +18,7 @@ from parquity.engines.external.protocol import (
     parse_info,
     parse_success,
 )
-from parquity.process import IS_WINDOWS
+from parquity.process import IS_WINDOWS, ProcessSupervisionError
 from tests.support import external_engine as bridge
 
 _INFO: dict[str, object] = {
@@ -200,6 +201,22 @@ def _require_process_absent(pid: int) -> None:
 def test_a_command_that_cannot_be_executed_is_reported_as_unavailable() -> None:
     with pytest.raises(BridgeUnavailableError, match="could not be executed"):
         run_bridge(("./no-such-bridge-executable",), ("info",), 30)
+
+
+def test_a_process_supervision_failure_is_reported_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervision_error = ProcessSupervisionError("process tree could not be shut down")
+
+    def fail_supervision(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise supervision_error
+
+    monkeypatch.setattr(bridge_process, "run_process", fail_supervision)
+
+    with pytest.raises(BridgeUnavailableError, match="could not be supervised") as raised:
+        run_bridge(("bridge",), ("info",), 30)
+    assert raised.value.__cause__ is supervision_error
 
 
 def test_diagnostics_join_a_detail_with_a_bounded_stderr_tail() -> None:

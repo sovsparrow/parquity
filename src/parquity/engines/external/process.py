@@ -3,14 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ...process import ProcessUnavailableError, run_process
+from ...process import ProcessSupervisionError, ProcessUnavailableError, run_process
 from .protocol import MAX_STREAM_BYTES, ExternalEngineProtocolError
 
 MAX_DETAIL_BYTES = 2048
 
 
 class BridgeUnavailableError(RuntimeError):
-    """The configured command could not be executed at all."""
+    """The configured bridge could not be started or supervised safely."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,8 +32,10 @@ def run_bridge(
             stdout_limit=MAX_STREAM_BYTES,
             stderr_limit=MAX_STREAM_BYTES,
         )
-    except (OSError, ProcessUnavailableError) as error:
+    except OSError as error:
         raise BridgeUnavailableError(f"bridge command could not be executed: {error}") from error
+    except (ProcessUnavailableError, ProcessSupervisionError) as error:
+        raise BridgeUnavailableError(f"bridge command could not be supervised: {error}") from error
     if not completed.timed_out and completed.stdout_truncated:
         raise ExternalEngineProtocolError(f"bridge stdout exceeds {MAX_STREAM_BYTES} bytes")
     return BridgeOutcome(
